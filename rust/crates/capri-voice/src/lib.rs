@@ -30,6 +30,7 @@ impl VoiceEngine {
     pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .http1_only()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { http })

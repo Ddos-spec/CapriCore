@@ -233,7 +233,7 @@ pub fn execute_desktop_action(args: &Value) -> Result<Value> {
 
             for ch in text.chars() {
                 let mut utf16 = [0u16; 2];
-                for &unit in ch.encode_utf16(&mut utf16) {
+                for &mut unit in ch.encode_utf16(&mut utf16) {
                     let inputs = [
                         INPUT {
                             r#type: INPUT_KEYBOARD,

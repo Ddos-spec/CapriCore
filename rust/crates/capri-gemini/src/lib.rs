@@ -66,6 +66,7 @@ impl GeminiClient {
     pub fn new(cookies_path: PathBuf, fallback_url: Option<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT_STR)
+            .http1_only()
             .timeout(std::time::Duration::from_secs(90))
             .build()?;
 
@@ -174,11 +175,19 @@ impl GeminiClient {
         }
 
         let mut rotated = false;
+        let mut last_err = String::new();
         let wiz_ok = match self.fetch_wiz_tokens().await {
             Ok(_) => true,
-            Err(_) => {
+            Err(e) => {
+                last_err = format!("{:#}", e);
                 rotated = self.rotate_cookies().await.unwrap_or(false);
-                self.fetch_wiz_tokens().await.is_ok()
+                match self.fetch_wiz_tokens().await {
+                    Ok(_) => true,
+                    Err(e2) => {
+                        last_err = format!("{:#}", e2);
+                        false
+                    }
+                }
             }
         };
 
@@ -192,7 +201,7 @@ impl GeminiClient {
             message: if wiz_ok {
                 "Cookies verified and WIZ tokens active".to_string()
             } else {
-                "Cookies saved, but Gemini WIZ extraction failed (check Google session)".to_string()
+                format!("WIZ extraction failed: {}", last_err)
             },
         })
     }
@@ -242,7 +251,7 @@ impl GeminiClient {
         match self.fetch_wiz_tokens_once().await {
             Ok(toks) => Ok(toks),
             Err(first_err) => {
-                warn!("First WIZ fetch failed ({}), attempting RotateCookies", first_err);
+                warn!("First WIZ fetch failed ({:#}), attempting RotateCookies", first_err);
                 let _ = self.rotate_cookies().await;
                 self.fetch_wiz_tokens_once().await
             }
