@@ -12,14 +12,15 @@
       {
         "label": "main",
         "title": "Capri",
-        "width": 460,
-        "height": 640,
+        "width": 360,
+        "height": 420,
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
         "skipTaskbar": false,
         "resizable": false,
-        "shadow": false
+        "shadow": false,
+        "additionalBrowserArgs": "--autoplay-policy=no-user-gesture-required"
       }
     ],
     "security": {

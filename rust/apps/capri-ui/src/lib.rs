@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::webview::{PermissionKind, PermissionResponse};
 use tauri::{PhysicalPosition, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -91,8 +92,8 @@ fn auto_perch_window(window: tauri::WebviewWindow) -> Result<Value, String> {
         return Ok(json!({ "ok": false, "reason": "no_target_window" }));
     };
     let scale = window.scale_factor().unwrap_or(1.0);
-    let win_w = (460.0 * scale).round() as i32;
-    let win_h = (640.0 * scale).round() as i32;
+    let win_w = (360.0 * scale).round() as i32;
+    let win_h = (420.0 * scale).round() as i32;
     let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
 
     // Perch on top-right corner of the active target window cleanly within screen bounds
@@ -115,8 +116,8 @@ fn auto_perch_window(window: tauri::WebviewWindow) -> Result<Value, String> {
 #[tauri::command]
 fn move_to_bottom_right(window: tauri::WebviewWindow) -> Result<Value, String> {
     let scale = window.scale_factor().unwrap_or(1.0);
-    let win_w = (460.0 * scale).round() as i32;
-    let win_h = (640.0 * scale).round() as i32;
+    let win_w = (360.0 * scale).round() as i32;
+    let win_h = (420.0 * scale).round() as i32;
     let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
     let x = (screen_w - win_w - 18).max(0);
     let y = (screen_h - win_h - 46).max(0);
@@ -124,6 +125,11 @@ fn move_to_bottom_right(window: tauri::WebviewWindow) -> Result<Value, String> {
         .set_position(PhysicalPosition::new(x, y))
         .map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "x": x, "y": y }))
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 fn resolve_assets_dir() -> PathBuf {
@@ -298,6 +304,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(state)
+        .on_permission_request(|_webview, kind| match kind {
+            PermissionKind::Microphone | PermissionKind::Camera => PermissionResponse::Allow,
+            _ => PermissionResponse::Default,
+        })
         .invoke_handler(tauri::generate_handler![
             get_runtime_config,
             update_hit_rects,
@@ -307,6 +317,7 @@ pub fn run() {
             exec_desktop_action,
             auto_perch_window,
             move_to_bottom_right,
+            quit_app,
         ])
         .setup(move |app| {
             use tauri::Manager;
@@ -320,8 +331,8 @@ pub fn run() {
             }
             let main_win = app.get_webview_window("main").unwrap();
             let scale = main_win.scale_factor().unwrap_or(1.0);
-            let win_w = (460.0 * scale).round() as i32;
-            let win_h = (640.0 * scale).round() as i32;
+            let win_w = (360.0 * scale).round() as i32;
+            let win_h = (420.0 * scale).round() as i32;
             let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
             let _ = main_win.set_position(PhysicalPosition::new(
                 (screen_w - win_w - 18).max(0),

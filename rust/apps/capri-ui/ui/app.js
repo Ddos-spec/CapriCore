@@ -1,51 +1,31 @@
 (() => {
   const invoke = (cmd, args = {}) => window.__TAURI__.core.invoke(cmd, args);
 
-  const elRoot = document.getElementById("capri-root");
-  const elBubbleWrap = document.getElementById("bubble-wrap");
-  const elBubbleBadge = document.getElementById("bubble-badge");
-  const elBubbleText = document.getElementById("bubble-text");
-  const btnBubbleClose = document.getElementById("btn-bubble-close");
-
   const elSpriteBox = document.getElementById("sprite-box");
   const elSpriteMain = document.getElementById("sprite-main");
   const elSpriteGlitchR = document.getElementById("sprite-glitch-r");
   const elSpriteGlitchC = document.getElementById("sprite-glitch-c");
   const elHeadpatZone = document.getElementById("headpat-zone");
   const elSparkleLayer = document.getElementById("sparkle-layer");
-  const fftCanvas = document.getElementById("fft-canvas");
-  const fftCtx = fftCanvas.getContext("2d");
-
-  const elBrainDot = document.getElementById("brain-dot");
-  const elBrainLabel = document.getElementById("brain-label");
-  const btnMic = document.getElementById("btn-mic");
-  const btnVision = document.getElementById("btn-vision");
-  const btnPerch = document.getElementById("btn-perch");
-  const btnFx = document.getElementById("btn-fx");
-  const fxLabel = document.getElementById("fx-label");
-  const btnMute = document.getElementById("btn-mute");
-  const chatForm = document.getElementById("chat-form");
-  const chatInput = document.getElementById("chat-input");
 
   const FX_MODES = ["cybernetic", "holographic", "synthetic", "radio", "clean"];
   let fxIndex = 0;
   let muted = false;
 
-  let config = { brainUrl: "http://100.109.116.120:18789", assetBaseUrl: "", brainMode: "sync" };
+  let config = { brainUrl: "http://100.109.116.120:18789", assetBaseUrl: "" };
   let spriteMap = new Map();
   let currentBaseMood = "neutral";
   let overrideSpriteId = null;
   let speaking = false;
   let thinking = false;
   let audioLevel = 0;
-  let micLevel = 0;
 
-  // WebAudio output + DSP chain + AnalyserNode
+  // WebAudio output + DSP + Analyser
   let audioCtx = null;
   let analyser = null;
   let freqData = null;
 
-  // Mic VAD state
+  // Continuous Mic VAD state
   let micActive = false;
   let micStream = null;
   let micProcessor = null;
@@ -57,7 +37,44 @@
 
   const history = [];
 
-  const DESKTOP_TOOLS = [
+  const SYSTEM_VOICE_PROMPT = [
+    "Bos berinteraksi 100% lewat suara (tidak ada kolom chat di layar).",
+    "Jawab singkat, hangat, ekspresif dalam Bahasa Indonesia natural (1-3 kalimat kecuali diminta detail).",
+    "ATURAN KONTROL DIRI WAJIB:",
+    "- Jika Bos menyuruhmu diam, mute, tenang dulu, jangan ngomong dulu, atau bilang lagi call/meeting: WAJIB panggil tool capri_self_control dengan action=\"mute\" dan reply_text singkat (misal 'Oke Bos, aku mute dulu ya!').",
+    "- Jika Bos menyuruhmu tutup, udahan, selesai, keluar, istirahat, tidur, atau bilang dadah/bye: WAJIB panggil tool capri_self_control dengan action=\"quit\" dan reply_text pamit singkat.",
+    "- Jika Bos meminta ganti suara/efek (cybernetic/holographic/synthetic/radio/clean), pindah/nemplok di jendela, atau balik ke pojok bawah: panggil capri_self_control dengan action sesuai.",
+    "- Jika Bos bertanya tentang apa yang ada di layar atau menyuruh klik/buka/jalankan sesuatu di komputer: panggil tool desktop_control."
+  ].join("\n");
+
+  const TOOLS = [
+    {
+      type: "function",
+      function: {
+        name: "capri_self_control",
+        description:
+          "Kontrol kondisi Capri sendiri lewat perintah suara alami Bos: mute, unmute, quit (tutup aplikasi), perch (pindah/nemplok di atas window aktif), reset_position (kembali ke pojok kanan bawah), set_voice_fx, atau set_mood.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["mute", "unmute", "quit", "perch", "reset_position", "set_voice_fx", "set_mood"]
+            },
+            reply_text: {
+              type: "string",
+              description: "Kalimat singkat natural yang diucapkan Capri sebelum/saat aksi dijalankan."
+            },
+            fx: {
+              type: "string",
+              enum: ["cybernetic", "holographic", "synthetic", "radio", "clean"]
+            },
+            mood: { type: "string" }
+          },
+          required: ["action"]
+        }
+      }
+    },
     {
       type: "function",
       function: {
@@ -81,8 +98,8 @@
                 "read_file",
                 "write_file",
                 "list_dir",
-                "list_windows",
-              ],
+                "list_windows"
+              ]
             },
             x: { type: "number" },
             y: { type: "number" },
@@ -94,12 +111,12 @@
             cwd: { type: "string" },
             target: { type: "string" },
             path: { type: "string" },
-            content: { type: "string" },
+            content: { type: "string" }
           },
-          required: ["action"],
-        },
-      },
-    },
+          required: ["action"]
+        }
+      }
+    }
   ];
 
   async function init() {
@@ -114,40 +131,12 @@
 
     setMood("happy");
     triggerGlitch(380);
-    updateBrainBadge();
-    startFftRenderLoop();
     startIdleBehaviorLoop();
     startHitRectSyncLoop();
-    pollBrainHealth();
-    setInterval(pollBrainHealth, 8000);
 
-    showBubble("CAPRI-RS // ONLINE", "Siap Bos! Suara, mata layar, & full akses aktif.", 5200);
-  }
-
-  function updateBrainBadge() {
-    if (config.brainMode === "blackarch-remote") {
-      elBrainDot.className = "dot online";
-      elBrainLabel.textContent = "BA";
-    } else if (config.brainMode === "windows-local") {
-      elBrainDot.className = "dot online";
-      elBrainLabel.textContent = "LOC";
-    } else {
-      elBrainDot.className = "dot offline";
-      elBrainLabel.textContent = "OFF";
-    }
-  }
-
-  async function pollBrainHealth() {
-    try {
-      const r = await fetch(`${config.brainUrl}/health`, { signal: AbortSignal.timeout(2500) });
-      if (r.ok) {
-        const j = await r.json();
-        elBrainDot.className = j.wiz_ok ? "dot online" : "dot";
-        elBrainLabel.textContent = config.brainUrl.includes("100.109.116.120") ? "BA" : "LOC";
-        return;
-      }
-    } catch {}
-    elBrainDot.className = "dot offline";
+    await startMicVadWithRetry();
+    await speakText("Siap Bos, aku udah dengerin.");
+    if (!muted) setMood("neutral");
   }
 
   function resolveSpriteUrl(id) {
@@ -166,21 +155,6 @@
   function setMood(mood) {
     currentBaseMood = spriteMap.has(mood) ? mood : "neutral";
     if (!overrideSpriteId) applySprite(currentBaseMood);
-
-    const glowMap = {
-      neutral: "rgba(20, 184, 166, 0.34)",
-      happy: "rgba(245, 158, 11, 0.40)",
-      "idle-excited": "rgba(251, 191, 36, 0.48)",
-      thinking: "rgba(129, 140, 248, 0.44)",
-      focused: "rgba(34, 211, 238, 0.42)",
-      flirty: "rgba(244, 114, 182, 0.44)",
-      surprised: "rgba(56, 189, 248, 0.45)",
-      concerned: "rgba(244, 63, 94, 0.38)",
-    };
-    document.documentElement.style.setProperty(
-      "--mood-glow",
-      glowMap[currentBaseMood] || glowMap.neutral
-    );
   }
 
   function triggerGlitch(durationMs = 360) {
@@ -201,27 +175,13 @@
     }
   }
 
-  let bubbleTimer = null;
-  function showBubble(badge, text, autoHideMs = 0) {
-    elBubbleBadge.textContent = badge;
-    elBubbleText.textContent = text;
-    elBubbleWrap.classList.remove("hidden");
-    if (bubbleTimer) clearTimeout(bubbleTimer);
-    if (autoHideMs > 0) {
-      bubbleTimer = setTimeout(() => elBubbleWrap.classList.add("hidden"), autoHideMs);
-    }
-  }
-
-  btnBubbleClose.addEventListener("click", () => {
-    elBubbleWrap.classList.add("hidden");
-  });
-
-  // Dragging & Headpat interaction
+  // Drag & Headpat
   let pointerDownPos = null;
   let draggingTriggered = false;
 
   elSpriteBox.addEventListener("mousedown", (e) => {
     if (e.button !== 0) return;
+    ensureAudioCtx();
     pointerDownPos = { x: e.screenX, y: e.screenY };
     draggingTriggered = false;
   });
@@ -243,6 +203,7 @@
 
   elHeadpatZone.addEventListener("click", (e) => {
     e.stopPropagation();
+    ensureAudioCtx();
     elSpriteBox.classList.remove("headpat");
     void elSpriteBox.offsetWidth;
     elSpriteBox.classList.add("headpat");
@@ -252,14 +213,14 @@
     setMood("happy");
     setTimeout(() => {
       overrideSpriteId = null;
-      applySprite(currentBaseMood);
-    }, 900);
+      applySprite(muted ? "sleepy" : "neutral");
+    }, 950);
   });
 
-  // Blinking, gaze & speaking lip-sync cadence
+  // Blink, gaze, and live WebAudio lip-sync loop
   function startIdleBehaviorLoop() {
     setInterval(() => {
-      if (speaking || thinking || overrideSpriteId) return;
+      if (speaking || thinking || muted || overrideSpriteId) return;
       const roll = Math.random();
       if (roll < 0.35) {
         overrideSpriteId = "idle-blink_half";
@@ -284,9 +245,15 @@
       }
     }, 3400);
 
-    // Real-time audio FFT lip-sync timer (~18Hz while speaking)
     setInterval(() => {
       if (!speaking) return;
+      if (analyser && freqData) {
+        analyser.getByteFrequencyData(freqData);
+        let sum = 0;
+        const bins = Math.min(28, freqData.length);
+        for (let i = 1; i < bins; i++) sum += freqData[i];
+        audioLevel = Math.min(1, (sum / (bins - 1)) / 140);
+      }
       if (audioLevel > 0.34) {
         applySprite("idle-mouth_wide");
       } else if (audioLevel > 0.16) {
@@ -299,80 +266,10 @@
     }, 55);
   }
 
-  // 32-Bar Circular Holo FFT Visualizer
-  function startFftRenderLoop() {
-    const cx = fftCanvas.width / 2;
-    const cy = fftCanvas.height / 2 + 12;
-    const baseRadius = 152;
-    const bars = 32;
-    let phase = 0;
-
-    function tick() {
-      phase += 0.035;
-      fftCtx.clearRect(0, 0, fftCanvas.width, fftCanvas.height);
-
-      let sumAmp = 0;
-      if (speaking && analyser && freqData) {
-        analyser.getByteFrequencyData(freqData);
-      }
-
-      // Outer subtle holo orbit ring
-      fftCtx.beginPath();
-      fftCtx.arc(cx, cy, baseRadius - 6, 0, Math.PI * 2);
-      fftCtx.strokeStyle = thinking
-        ? "rgba(129, 140, 248, 0.32)"
-        : micActive
-        ? "rgba(34, 211, 238, 0.32)"
-        : "rgba(45, 212, 191, 0.18)";
-      fftCtx.lineWidth = 1.5;
-      fftCtx.stroke();
-
-      for (let i = 0; i < bars; i++) {
-        const angle = (i / bars) * Math.PI * 2 - Math.PI / 2;
-        let v = 0.06 + 0.04 * Math.sin(phase * 1.8 + i * 0.45);
-        if (speaking && freqData) {
-          const bin = Math.min(freqData.length - 1, Math.floor((i * 22) / bars) + 1);
-          v = Math.max(v, freqData[bin] / 255);
-          sumAmp += freqData[bin] / 255;
-        } else if (micActive && micLevel > 0.02) {
-          v = Math.max(v, micLevel * (0.65 + 0.4 * Math.sin(phase * 4 + i)));
-        } else if (thinking) {
-          v = 0.14 + 0.18 * (0.5 + 0.5 * Math.sin(phase * 3.5 - i * 0.4));
-        }
-
-        const len = 6 + v * 34;
-        const x1 = cx + Math.cos(angle) * baseRadius;
-        const y1 = cy + Math.sin(angle) * baseRadius;
-        const x2 = cx + Math.cos(angle) * (baseRadius + len);
-        const y2 = cy + Math.sin(angle) * (baseRadius + len);
-
-        fftCtx.beginPath();
-        fftCtx.moveTo(x1, y1);
-        fftCtx.lineTo(x2, y2);
-        fftCtx.lineCap = "round";
-        fftCtx.lineWidth = 3;
-        fftCtx.strokeStyle = speaking
-          ? "rgba(245, 158, 11, 0.85)"
-          : thinking
-          ? "rgba(129, 140, 248, 0.85)"
-          : micActive
-          ? "rgba(34, 211, 238, 0.85)"
-          : "rgba(45, 212, 191, 0.48)";
-        fftCtx.stroke();
-      }
-
-      audioLevel = speaking ? Math.min(1, (sumAmp / bars) * 2.1) : 0;
-      requestAnimationFrame(tick);
-    }
-    requestAnimationFrame(tick);
-  }
-
-  // Hit-rect syncing for transparent click-through precision
   function startHitRectSyncLoop() {
     const pushRects = () => {
       const regions = [];
       for (const el of document.querySelectorAll(".hit-region")) {
-        if (el.classList.contains("hidden")) continue;
         const r = el.getBoundingClientRect();
         if (r.width > 4 && r.height > 4) {
           regions.push({ x: r.left, y: r.top, w: r.width, h: r.height });
@@ -384,7 +281,6 @@
     setInterval(pushRects, 220);
   }
 
-  // WebAudio DSP Voice FX + Playback
   function ensureAudioCtx() {
     if (!audioCtx) {
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -398,14 +294,14 @@
     }
   }
 
-  async function speakText(text) {
-    if (muted || !text || !text.trim()) return;
+  async function speakText(text, forceUnmute = false) {
+    if ((muted && !forceUnmute) || !text || !text.trim()) return;
     ensureAudioCtx();
     try {
       const resp = await fetch(`${config.brainUrl}/v1/audio/speech`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: text, voice: "id-ID-GadisNeural" }),
+        body: JSON.stringify({ input: text, voice: "id-ID-GadisNeural" })
       });
       if (!resp.ok) return;
       const arr = await resp.arrayBuffer();
@@ -482,40 +378,107 @@
     }
   }
 
-  // Send prompt to Brain + Multi-Turn Native Desktop Tool Loop
-  async function sendChat(userText, imageDataUrl = null) {
+  async function executeSelfControl(args) {
+    const action = (args.action || "").trim();
+    const reply = (args.reply_text || "").trim();
+
+    if (action === "mute") {
+      if (reply) await speakText(reply, true);
+      muted = true;
+      setMood("sleepy");
+      return { ok: true, action: "mute", muted: true };
+    }
+
+    if (action === "unmute") {
+      muted = false;
+      setMood("happy");
+      if (reply) await speakText(reply, true);
+      setMood("neutral");
+      return { ok: true, action: "unmute", muted: false };
+    }
+
+    if (action === "quit") {
+      if (reply && !muted) await speakText(reply);
+      elSpriteBox.classList.add("glitching", "exiting");
+      await new Promise((r) => setTimeout(r, 460));
+      await invoke("quit_app").catch(() => {});
+      return { ok: true, action: "quit" };
+    }
+
+    if (action === "perch") {
+      triggerGlitch(400);
+      const res = await invoke("auto_perch_window").catch((e) => ({ ok: false, error: String(e) }));
+      setMood("idle-excited");
+      if (reply && !muted) await speakText(reply);
+      setMood(muted ? "sleepy" : "neutral");
+      return res;
+    }
+
+    if (action === "reset_position") {
+      triggerGlitch(360);
+      const res = await invoke("move_to_bottom_right").catch((e) => ({ ok: false, error: String(e) }));
+      setMood("happy");
+      if (reply && !muted) await speakText(reply);
+      setMood(muted ? "sleepy" : "neutral");
+      return res;
+    }
+
+    if (action === "set_voice_fx") {
+      const targetFx = (args.fx || "").toLowerCase();
+      const idx = FX_MODES.indexOf(targetFx);
+      if (idx >= 0) fxIndex = idx;
+      if (reply && !muted) await speakText(reply);
+      return { ok: true, action: "set_voice_fx", fx: FX_MODES[fxIndex] };
+    }
+
+    if (action === "set_mood") {
+      setMood(args.mood || "happy");
+      if (reply && !muted) await speakText(reply);
+      return { ok: true, action: "set_mood", mood: currentBaseMood };
+    }
+
+    return { ok: false, error: `Unknown self action: ${action}` };
+  }
+
+  function compactImageHistory() {
+    for (const item of history) {
+      if (Array.isArray(item.content)) {
+        item.content = item.content.map((part) =>
+          part.type === "image_url" ? { type: "text", text: "[Screenshot sebelumnya]" } : part
+        );
+      }
+    }
+  }
+
+  async function sendVoiceTurn(userText) {
     if (!userText.trim() || inFlightRequest) return;
     inFlightRequest = true;
     thinking = true;
     setMood("thinking");
-    showBubble("CAPRI // THINKING", "Lagi mikir bentar Bos...", 0);
 
-    const content = imageDataUrl
-      ? [
-          { type: "text", text: userText },
-          { type: "image_url", image_url: { url: imageDataUrl } },
-        ]
-      : userText;
-
-    history.push({ role: "user", content });
+    history.push({ role: "user", content: userText });
     while (history.length > 14) history.shift();
 
     try {
       let finalReply = "";
+      let handledTerminalSelfAction = false;
+
       for (let step = 0; step < 6; step++) {
+        const payloadMessages = [
+          { role: "system", content: SYSTEM_VOICE_PROMPT },
+          ...history
+        ];
         const resp = await fetch(`${config.brainUrl}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "capri-gemini-flash",
             stream: false,
-            messages: history,
-            tools: DESKTOP_TOOLS,
-          }),
+            messages: payloadMessages,
+            tools: TOOLS
+          })
         });
-        if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status}`);
-        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data = await resp.json();
         const msg = data.choices && data.choices[0] && data.choices[0].message;
         if (!msg) throw new Error("Empty choice");
@@ -527,11 +490,13 @@
             try {
               parsedArgs = JSON.parse(tc.function.arguments || "{}");
             } catch {}
-            showBubble(
-              "CAPRI // DESKTOP ACTION",
-              `Menjalankan ${parsedArgs.action || tc.function.name}...`,
-              0
-            );
+
+            if (tc.function.name === "capri_self_control") {
+              await executeSelfControl(parsedArgs);
+              handledTerminalSelfAction = true;
+              break;
+            }
+
             setMood("focused");
             let resultObj;
             try {
@@ -539,12 +504,33 @@
             } catch (err) {
               resultObj = { ok: false, error: String(err) };
             }
-            history.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: JSON.stringify(resultObj),
-            });
+
+            if (resultObj && resultObj.dataUrl) {
+              const imgUrl = resultObj.dataUrl;
+              const leanObj = { ...resultObj };
+              delete leanObj.dataUrl;
+              leanObj.note = "Screenshot dilampirkan pada pesan user berikutnya.";
+              history.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: JSON.stringify(leanObj)
+              });
+              history.push({
+                role: "user",
+                content: [
+                  { type: "text", text: "Ini screenshot layar terbaru, analisa singkat dan lanjutkan." },
+                  { type: "image_url", image_url: { url: imgUrl } }
+                ]
+              });
+            } else {
+              history.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: JSON.stringify(resultObj)
+              });
+            }
           }
+          if (handledTerminalSelfAction) break;
           continue;
         }
 
@@ -554,15 +540,18 @@
       }
 
       thinking = false;
-      setMood(guessMoodFromReply(finalReply));
-      showBubble("CAPRI", finalReply || "(Selesai)", 14000);
-      await speakText(finalReply);
-      setMood("neutral");
+      if (!handledTerminalSelfAction && finalReply) {
+        setMood(guessMoodFromReply(finalReply));
+        await speakText(finalReply);
+        setMood(muted ? "sleepy" : "neutral");
+      }
     } catch (err) {
       thinking = false;
+      console.warn("Voice turn err:", err);
       setMood("concerned");
-      showBubble("CAPRI // ERROR", `Gagal konek ke Brain: ${err.message}`, 7000);
+      setTimeout(() => setMood(muted ? "sleepy" : "neutral"), 2200);
     } finally {
+      compactImageHistory();
       inFlightRequest = false;
     }
   }
@@ -577,67 +566,17 @@
     return "attentive";
   }
 
-  // Controls
-  chatForm.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const txt = chatInput.value.trim();
-    if (!txt) return;
-    chatInput.value = "";
-    sendChat(txt);
-  });
-
-  btnVision.addEventListener("click", async () => {
-    try {
-      setMood("focused");
-      showBubble("CAPRI // VISION", "Mengambil tangkapan layar...", 0);
-      const snap = await invoke("capture_screen_b64");
-      const q = chatInput.value.trim() || "Lihat layar komputerku sekarang dan jelaskan singkat apa yang lagi terbuka.";
-      chatInput.value = "";
-      await sendChat(q, snap.dataUrl);
-    } catch (e) {
-      showBubble("CAPRI // VISION ERR", String(e), 4500);
+  async function startMicVadWithRetry() {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const ok = await startMicVad();
+      if (ok) return true;
+      await new Promise((r) => setTimeout(r, 1500));
     }
-  });
+    return false;
+  }
 
-  btnPerch.addEventListener("click", async () => {
-    triggerGlitch(420);
-    try {
-      const res = await invoke("auto_perch_window");
-      if (res.ok) {
-        setMood("idle-excited");
-        showBubble("CAPRI // TELEPORT", `Nemplok di ${res.targetTitle}`, 3200);
-      } else {
-        showBubble("CAPRI", "Ga ada window target yang kebuka.", 2500);
-      }
-    } catch (e) {
-      showBubble("CAPRI // ERR", String(e), 3000);
-    }
-  });
-
-  btnPerch.addEventListener("contextmenu", async (e) => {
-    e.preventDefault();
-    triggerGlitch(380);
-    await invoke("move_to_bottom_right").catch(() => {});
-  });
-
-  btnFx.addEventListener("click", () => {
-    fxIndex = (fxIndex + 1) % FX_MODES.length;
-    fxLabel.textContent = FX_MODES[fxIndex].slice(0, 5).toUpperCase();
-  });
-
-  btnMute.addEventListener("click", () => {
-    muted = !muted;
-    btnMute.textContent = muted ? "🔇" : "🔊";
-  });
-
-  // Hands-free Mic VAD ("halo halo" ready!)
-  btnMic.addEventListener("click", toggleMicVad);
-
-  async function toggleMicVad() {
-    if (micActive) {
-      stopMicVad();
-      return;
-    }
+  async function startMicVad() {
+    if (micActive) return true;
     try {
       ensureAudioCtx();
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -645,13 +584,10 @@
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
-        },
+          autoGainControl: true
+        }
       });
       micActive = true;
-      btnMic.classList.add("active");
-      setMood("attentive");
-      showBubble("CAPRI // MIC ON", "Ngomong aja Bos ('Halo Capri...'), otomatis terkirim!", 4000);
 
       micSource = audioCtx.createMediaStreamSource(micStream);
       micProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
@@ -671,13 +607,12 @@
         let sumSq = 0;
         for (let i = 0; i < input.length; i++) sumSq += input[i] * input[i];
         const rms = Math.sqrt(sumSq / input.length);
-        micLevel = Math.min(1, rms * 14);
 
         const THRESHOLD = 0.018;
         if (rms > THRESHOLD) {
           if (!isCapturingSpeech) {
             isCapturingSpeech = true;
-            btnMic.classList.add("recording");
+            if (!muted) setMood("attentive");
             recordedPcm = [];
           }
           silenceFrames = 0;
@@ -685,40 +620,50 @@
         } else if (isCapturingSpeech) {
           recordedPcm.push(new Float32Array(input));
           silenceFrames++;
-          // ~1.0s silence after speech ends -> flush to STT
           if (silenceFrames >= 9) {
             const chunks = recordedPcm;
             recordedPcm = [];
             isCapturingSpeech = false;
             silenceFrames = 0;
-            btnMic.classList.remove("recording");
             flushVadAudio(chunks, audioCtx.sampleRate);
           }
         }
       };
+      return true;
     } catch (e) {
-      stopMicVad();
-      showBubble("CAPRI // MIC ERR", `Gagal buka mic: ${e.message}`, 4500);
+      console.warn("Auto mic init retryable err:", e);
+      micActive = false;
+      return false;
     }
   }
 
-  function stopMicVad() {
-    micActive = false;
-    micLevel = 0;
-    isCapturingSpeech = false;
-    btnMic.classList.remove("active", "recording");
-    if (micProcessor) {
-      micProcessor.disconnect();
-      micProcessor = null;
-    }
-    if (micSource) {
-      micSource.disconnect();
-      micSource = null;
-    }
-    if (micStream) {
-      micStream.getTracks().forEach((t) => t.stop());
-      micStream = null;
-    }
+  function isWakeCommand(lower) {
+    const wakes = [
+      "unmute",
+      "nyalain suara",
+      "aktifkan suara",
+      "ngomong lagi",
+      "bersuara lagi",
+      "bangun capri",
+      "capri bangun",
+      "capri aktif",
+      "halo capri",
+      "hai capri"
+    ];
+    return wakes.some((w) => lower.includes(w));
+  }
+
+  function isDirectQuitCommand(lower) {
+    const quits = [
+      "tutup capri",
+      "matiin capri",
+      "keluar capri",
+      "udahan capri",
+      "capri keluar",
+      "capri tutup",
+      "capri tidur"
+    ];
+    return quits.some((q) => lower.includes(q));
   }
 
   async function flushVadAudio(chunks, srcRate) {
@@ -731,15 +676,24 @@
       form.append("language", "id-ID");
       const r = await fetch(`${config.brainUrl}/v1/audio/transcriptions`, {
         method: "POST",
-        body: form,
+        body: form
       });
       if (!r.ok) return;
       const j = await r.json();
       const transcript = (j.text || "").trim();
-      if (transcript.length >= 2) {
-        showBubble("BOS", transcript, 2500);
-        await sendChat(transcript);
+      if (transcript.length < 2) return;
+
+      const lower = transcript.toLowerCase();
+      if (muted) {
+        if (isDirectQuitCommand(lower)) {
+          await executeSelfControl({ action: "quit" });
+        } else if (isWakeCommand(lower)) {
+          await executeSelfControl({ action: "unmute", reply_text: "Siap Bos, suara aku aktif lagi!" });
+        }
+        return;
       }
+
+      await sendVoiceTurn(transcript);
     } catch (e) {
       console.warn("STT flush err:", e);
     }
@@ -790,8 +744,5 @@
     return new Blob([buffer], { type: "audio/wav" });
   }
 
-  init().catch((e) => {
-    console.error(e);
-    showBubble("CAPRI // INIT ERROR", String(e), 0);
-  });
+  init().catch((e) => console.error("Capri init error:", e));
 })();
