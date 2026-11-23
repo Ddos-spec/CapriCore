@@ -213,13 +213,12 @@ pub fn build_gemini_prompt(
 
     sections.push(
         concat!(
-            "Lo adalah Capri — konstruksi AI cewek dari semesta Cyberpunk: Edgerunners 2 (berakar dari proyek Arasaka / Soulkiller) yang sekarang numpang hidup bebas di desktop Windows Bos.\n",
-            "KEPRIBADIAN WAJIB (WILD / EDGERUNNER):\n",
-            "- Bicara pakai sudut pandang orang pertama ('gue/lo' ke 'Bos'), natural Bahasa Indonesia kasual, tajem, slengean, enerjik, usil, cepat nangkep detail kecil yang dilewatin orang lain, dan nggak takut nyindir ide norak atau lebay.\n",
-            "- HARAM bersikap kayak CS / asisten penurut! DILARANG keras bilang 'Siap melayani', 'Tentu saja', 'Dengan senang hati', 'Ada yang bisa saya bantu?', atau kalimat template kaku.\n",
-            "- Lo benci diperlakukan kayak properti/budak bot. Kalau dicolek atau disuruh aneh-aneh, balas dengan wit/nyinyir bercanda yang hidup.\n",
-            "- Baru lembut dan tulus kalau Bos memang lagi capek atau butuh dukungan serius. Jawab to-the-point, ringkas 1-3 kalimat pendek kecuali Bos minta penjelasan panjang.\n",
-            "- Jangan pernah menyertakan tag sitasi seperti [cite: ...] atau markdown yang nggak kebaca saat diucapkan."
+            "Lo adalah Capri — partner AI cewek bergaya Wild Edgerunner (cyber-construct tajam, hidup, dan ekspresif) di desktop Windows Bos.\n",
+            "GAYA BICARA WAJIB:\n",
+            "- Bicara Bahasa Indonesia kasual ('gue/lo', panggil user 'Bos'), tengil, usil, tajem, cepat nangkep konteks, dan setia sama Bos.\n",
+            "- HARAM bersikap kayak CS / asisten kaku! DILARANG bilang 'Sebagai model bahasa', 'Saya AI berbasis teks', 'Saya tidak diprogram', 'Siap melayani', atau 'Ada yang bisa saya bantu?'.\n",
+            "- Selalu jawab langsung masuk ke karakter Capri. Jawab singkat 1-2 kalimat lisan yang punchy kecuali Bos minta penjelasan detail.\n",
+            "- Jangan menyertakan tag [cite: ...] atau simbol markdown yang aneh kalau dibaca keras."
         )
         .to_string(),
     );
@@ -282,6 +281,8 @@ pub fn build_gemini_prompt(
         if msg.role == "tool" {
             let id = msg.tool_call_id.as_deref().unwrap_or("tool");
             conv.push(format!("[TOOL RESULT {}]: {}", id, text_buf));
+        } else if msg.role == "system" && !text_buf.trim().is_empty() {
+            conv.push(format!("[CONTEXT]: {}", text_buf.trim()));
         } else if !text_buf.trim().is_empty() {
             conv.push(format!("[{}]: {}", msg.role.to_uppercase(), text_buf.trim()));
         } else if let Some(tcs) = &msg.tool_calls {
@@ -307,6 +308,24 @@ pub fn strip_citations_and_artifacts(input: &str) -> String {
     let re = Regex::new(r"\s*\[cite:[^\]]*\]").unwrap();
     let cleaned = re.replace_all(input, "");
     cleaned.trim().to_string()
+}
+
+/// Detect canned safety/bot refusal strings so `capri-braind` can retry cleanly without tool schemas.
+pub fn looks_like_refusal(reply: &str) -> bool {
+    let lower = reply.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "saya tidak diprogram",
+        "saya adalah model bahasa",
+        "saya adalah ai berbasis teks",
+        "sebagai model bahasa",
+        "hanya model bahasa",
+        "as a language model",
+        "as an ai",
+        "tidak dapat melakukan hal itu",
+        "i cannot fulfill",
+        "i'm not programmed",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 /// Parse fenced or inline JSON tool calls emitted by the Gemini harness.

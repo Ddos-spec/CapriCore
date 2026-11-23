@@ -13,6 +13,233 @@ pub struct WindowRectInfo {
     pub height: i32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ForegroundSnapshot {
+    pub fg_title: String,
+    pub fg_exe: String,
+    pub fg_x: i32,
+    pub fg_y: i32,
+    pub fg_w: i32,
+    pub fg_h: i32,
+    pub fg_fullscreen: bool,
+    pub activity_mode: String,
+    pub idle_ms: u32,
+    pub battery_pct: u8,
+    pub on_ac: bool,
+}
+
+fn classify_activity(exe: &str, title: &str, fg_fullscreen: bool) -> String {
+    let e = exe.to_ascii_lowercase();
+    let t = title.to_ascii_lowercase();
+    if [
+        "code.exe",
+        "cursor.exe",
+        "windowsterminal.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd.exe",
+        "idea64.exe",
+        "webstorm64.exe",
+        "pycharm64.exe",
+        "zed.exe",
+        "nvim.exe",
+        "sublime_text.exe",
+        "githubdesktop.exe",
+    ]
+    .iter()
+    .any(|k| e == *k)
+        || e.contains("antigravity")
+        || t.contains("visual studio code")
+        || t.contains("antigravity")
+        || t.contains("powershell")
+        || t.contains("terminal")
+    {
+        return "coding".to_string();
+    }
+
+    if ["spotify.exe", "foobar2000.exe", "aimp.exe"]
+        .iter()
+        .any(|k| e == *k)
+        || (e == "vlc.exe" && !fg_fullscreen)
+        || t.contains("spotify")
+        || t.contains("youtube music")
+        || t.contains("soundcloud")
+        || t.contains("lo-fi")
+        || t.contains("lofi")
+        || t.contains("official music video")
+        || t.contains("lyrics")
+        || t.contains("playlist")
+    {
+        return "music".to_string();
+    }
+
+    if fg_fullscreen
+        || ["steam.exe", "valorant.exe", "genshinimpact.exe", "cyberpunk2077.exe", "robloxplayerbeta.exe", "minecraft.exe", "mpv.exe", "obs64.exe"]
+            .iter()
+            .any(|k| e == *k)
+        || t.contains("youtube")
+        || t.contains("netflix")
+        || t.contains("twitch")
+        || t.contains("disney+")
+        || t.contains("prime video")
+        || t.contains("bilibili")
+    {
+        return "video_game".to_string();
+    }
+
+    if [
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe",
+        "discord.exe",
+        "whatsapp.exe",
+        "telegram.exe",
+        "notion.exe",
+        "obsidian.exe",
+        "acrobat.exe",
+        "sumatrapdf.exe",
+    ]
+    .iter()
+    .any(|k| e == *k)
+    {
+        return "browsing".to_string();
+    }
+
+    "desktop".to_string()
+}
+
+#[cfg(target_os = "windows")]
+pub fn sample_foreground_and_system() -> ForegroundSnapshot {
+    use windows_sys::Win32::Foundation::{CloseHandle, RECT};
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    };
+
+    let (screen_w, screen_h) = get_primary_screen_rect();
+    let mut fg_title = String::new();
+    let mut fg_exe = String::new();
+    let mut fg_x = 0;
+    let mut fg_y = 0;
+    let mut fg_w = 0;
+    let mut fg_h = 0;
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if !hwnd.is_null() {
+            let mut buf = [0u16; 256];
+            let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if len > 0 {
+                fg_title = String::from_utf16_lossy(&buf[..len as usize]);
+            }
+            let mut rect: RECT = std::mem::zeroed();
+            if GetWindowRect(hwnd, &mut rect) != 0 {
+                fg_x = rect.left;
+                fg_y = rect.top;
+                fg_w = (rect.right - rect.left).max(0);
+                fg_h = (rect.bottom - rect.top).max(0);
+            }
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != 0 {
+                let h_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if !h_proc.is_null() {
+                    let mut pbuf = [0u16; 512];
+                    let mut psize = pbuf.len() as u32;
+                    if QueryFullProcessImageNameW(h_proc, 0, pbuf.as_mut_ptr(), &mut psize) != 0 {
+                        let full = String::from_utf16_lossy(&pbuf[..psize as usize]);
+                        fg_exe = full
+                            .rsplit(['\\', '/'])
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                    }
+                    CloseHandle(h_proc);
+                }
+            }
+        }
+
+        let mut lii: LASTINPUTINFO = std::mem::zeroed();
+        lii.cbSize = std::mem::size_of::<LASTINPUTINFO>() as u32;
+        let idle_ms = if GetLastInputInfo(&mut lii) != 0 {
+            GetTickCount().wrapping_sub(lii.dwTime)
+        } else {
+            0
+        };
+
+        let mut sps: SYSTEM_POWER_STATUS = std::mem::zeroed();
+        let (battery_pct, on_ac) = if GetSystemPowerStatus(&mut sps) != 0 {
+            (sps.BatteryLifePercent, sps.ACLineStatus != 0)
+        } else {
+            (255, true)
+        };
+
+        let fg_fullscreen = fg_w >= screen_w - 8
+            && fg_h >= screen_h - 8
+            && fg_exe != "explorer.exe"
+            && fg_exe != "capri-ui.exe"
+            && fg_title != "Program Manager"
+            && !fg_title.is_empty();
+
+        let activity_mode = classify_activity(&fg_exe, &fg_title, fg_fullscreen);
+
+        ForegroundSnapshot {
+            fg_title,
+            fg_exe,
+            fg_x,
+            fg_y,
+            fg_w,
+            fg_h,
+            fg_fullscreen,
+            activity_mode,
+            idle_ms,
+            battery_pct,
+            on_ac,
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn sample_foreground_and_system() -> ForegroundSnapshot {
+    ForegroundSnapshot {
+        fg_title: String::new(),
+        fg_exe: String::new(),
+        fg_x: 0,
+        fg_y: 0,
+        fg_w: 0,
+        fg_h: 0,
+        fg_fullscreen: false,
+        activity_mode: "desktop".to_string(),
+        idle_ms: 0,
+        battery_pct: 255,
+        on_ac: true,
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_summon_hotkey_pressed() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    unsafe {
+        let ctrl = GetAsyncKeyState(0x11) < 0;
+        let alt = GetAsyncKeyState(0x12) < 0;
+        let shift = GetAsyncKeyState(0x10) < 0;
+        let c_key = GetAsyncKeyState(0x43) < 0;
+        (ctrl || alt) && shift && c_key
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_summon_hotkey_pressed() -> bool {
+    false
+}
+
 /// Capture the primary monitor, downscale to max width 1280, and encode as JPEG base64 data URL.
 pub fn capture_screen_data_url() -> Result<(String, u32, u32)> {
     let monitors = xcap::Monitor::all().map_err(|e| anyhow!("Monitor::all failed: {}", e))?;

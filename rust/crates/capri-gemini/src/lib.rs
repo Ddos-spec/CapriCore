@@ -67,7 +67,9 @@ impl GeminiClient {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT_STR)
             .http1_only()
-            .timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(0)
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .timeout(std::time::Duration::from_secs(22))
             .build()?;
 
         let loaded = if cookies_path.exists() {
@@ -438,6 +440,7 @@ impl GeminiClient {
         let resp = self
             .http
             .post(&url)
+            .timeout(std::time::Duration::from_secs(18))
             .header(COOKIE, &cookie_str)
             .header(ORIGIN, "https://gemini.google.com")
             .header(REFERER, "https://gemini.google.com/")

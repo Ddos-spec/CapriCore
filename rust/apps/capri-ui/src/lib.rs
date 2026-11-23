@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::webview::{PermissionKind, PermissionResponse};
-use tauri::{PhysicalPosition, State};
+use tauri::{Emitter, PhysicalPosition, PhysicalSize, Size, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -29,7 +29,7 @@ pub struct UiState {
 }
 
 #[tauri::command]
-fn get_runtime_config(state: State<'_, UiState>) -> Value {
+fn get_runtime_config(window: tauri::WebviewWindow, state: State<'_, UiState>) -> Value {
     let load_json = |rel: &str, fallback: Value| -> Value {
         let p = state.assets_dir.join(rel);
         std::fs::read_to_string(&p)
@@ -37,15 +37,21 @@ fn get_runtime_config(state: State<'_, UiState>) -> Value {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(fallback)
     };
+    let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
+    let sf = window.scale_factor().unwrap_or(1.0);
 
     json!({
         "brainUrl": state.brain_url,
         "brainMode": state.brain_mode,
         "assetBaseUrl": state.asset_base_url,
         "assetsDir": state.assets_dir.display().to_string(),
+        "screenWidth": (screen_w as f64) / sf,
+        "screenHeight": ((screen_h - 1).max(600) as f64) / sf,
+        "scaleFactor": sf,
         "manifest": load_json("capri/sprites/v1/runtime-sprite-set.json", json!({ "sprites": [] })),
         "intro": load_json("capri/intro-v1/runtime-intro.json", json!({ "frames": [] })),
         "poses": load_json("capri/sprites/poses-v2/runtime-poses.json", json!({ "sprites": [] })),
+        "music": load_json("default/capri-music-v1/runtime-music.json", json!({})),
         "fullAccess": true
     })
 }
@@ -60,11 +66,7 @@ fn update_hit_rects(state: State<'_, UiState>, rects: Vec<HitRect>) {
 #[tauri::command]
 fn set_dragging(state: State<'_, UiState>, window: tauri::WebviewWindow, active: bool) -> Result<(), String> {
     state.dragging_active.store(active, Ordering::Relaxed);
-    if active {
-        let _ = window.set_ignore_cursor_events(false);
-        let _ = window.start_dragging();
-        state.dragging_active.store(false, Ordering::Relaxed);
-    }
+    let _ = window.set_ignore_cursor_events(!active);
     Ok(())
 }
 
@@ -93,88 +95,86 @@ fn auto_perch_window(window: tauri::WebviewWindow) -> Result<Value, String> {
     let Some(target) = wins.first() else {
         return Ok(json!({ "ok": false, "reason": "no_target_window" }));
     };
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let win_w = (360.0 * scale).round() as i32;
-    let win_h = (420.0 * scale).round() as i32;
+    let sf = window.scale_factor().unwrap_or(1.0);
+    let actor_size = 320.0;
     let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
+    let logical_w = (screen_w as f64) / sf;
+    let logical_h = ((screen_h - 1).max(600) as f64) / sf;
 
-    // Perch on top-right corner of the active target window cleanly within screen bounds
-    let target_x = (target.x + target.width - win_w - 12).clamp(0, (screen_w - win_w).max(0));
-    let target_y = (target.y - (win_h as f64 * 0.42).round() as i32)
-        .clamp(0, (screen_h - win_h).max(0));
-
-    window
-        .set_position(PhysicalPosition::new(target_x, target_y))
-        .map_err(|e| e.to_string())?;
+    let fg_rect = json!({
+        "x": (target.x as f64) / sf,
+        "y": (target.y as f64) / sf,
+        "w": (target.width as f64) / sf,
+        "h": (target.height as f64) / sf,
+    });
+    let target_x = ((target.x as f64) / sf + (target.width as f64) / sf - actor_size - 16.0)
+        .clamp(0.0, (logical_w - actor_size).max(0.0));
+    let target_y = ((target.y as f64) / sf - actor_size * 0.56)
+        .clamp(0.0, (logical_h - actor_size).max(0.0));
 
     Ok(json!({
         "ok": true,
+        "spot": "perch",
         "targetTitle": target.title,
-        "x": target_x,
-        "y": target_y
+        "fgRect": fg_rect,
+        "x": target_x.round(),
+        "y": target_y.round()
     }))
 }
 
 #[tauri::command]
 fn move_to_bottom_right(window: tauri::WebviewWindow) -> Result<Value, String> {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let win_w = (360.0 * scale).round() as i32;
-    let win_h = (420.0 * scale).round() as i32;
+    let sf = window.scale_factor().unwrap_or(1.0);
+    let actor_size = 320.0;
     let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
-    let x = (screen_w - win_w - 18).max(0);
-    let y = (screen_h - win_h - 46).max(0);
-    window
-        .set_position(PhysicalPosition::new(x, y))
-        .map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true, "x": x, "y": y }))
+    let logical_w = (screen_w as f64) / sf;
+    let logical_h = ((screen_h - 1).max(600) as f64) / sf;
+    let x = (logical_w - actor_size - 18.0).max(0.0).round();
+    let y = (logical_h - actor_size - 48.0).max(0.0).round();
+    Ok(json!({ "ok": true, "spot": "bottom_right", "x": x, "y": y }))
 }
 
 #[tauri::command]
 fn move_to_spot(window: tauri::WebviewWindow, spot: String) -> Result<Value, String> {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let win_w = (360.0 * scale).round() as i32;
-    let win_h = (420.0 * scale).round() as i32;
+    let sf = window.scale_factor().unwrap_or(1.0);
+    let actor_size = 320.0;
     let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
+    let logical_w = (screen_w as f64) / sf;
+    let logical_h = ((screen_h - 1).max(600) as f64) / sf;
 
     match spot.as_str() {
-        "perch" => return auto_perch_window(window),
-        "ceiling" => {
-            let x = ((screen_w - win_w) / 2).max(0);
-            let y = -((24.0 * scale).round() as i32);
-            window
-                .set_position(PhysicalPosition::new(x, y))
-                .map_err(|e| e.to_string())?;
-            return Ok(json!({ "ok": true, "spot": "ceiling", "x": x, "y": y }));
-        }
-        "dock_left" => {
-            let x = -((48.0 * scale).round() as i32);
-            let y = ((screen_h - win_h) / 2).max(0);
-            window
-                .set_position(PhysicalPosition::new(x, y))
-                .map_err(|e| e.to_string())?;
-            return Ok(json!({ "ok": true, "spot": "dock_left", "x": x, "y": y }));
-        }
-        "dock_right" => {
-            let x = screen_w - win_w + ((48.0 * scale).round() as i32);
-            let y = ((screen_h - win_h) / 2).max(0);
-            window
-                .set_position(PhysicalPosition::new(x, y))
-                .map_err(|e| e.to_string())?;
-            return Ok(json!({ "ok": true, "spot": "dock_right", "x": x, "y": y }));
-        }
-        "bottom_left" | "sit_floor" => {
-            let x = if spot == "bottom_left" {
-                (22.0 * scale).round() as i32
-            } else {
-                (screen_w - win_w - 220).max(24)
-            };
-            let y = (screen_h - win_h - 46).max(0);
-            window
-                .set_position(PhysicalPosition::new(x, y))
-                .map_err(|e| e.to_string())?;
-            return Ok(json!({ "ok": true, "spot": spot, "x": x, "y": y }));
-        }
-        _ => return move_to_bottom_right(window),
+        "perch" => auto_perch_window(window),
+        "ceiling" => Ok(json!({
+            "ok": true,
+            "spot": "ceiling",
+            "x": ((logical_w - actor_size) * 0.5).max(0.0).round(),
+            "y": -18.0
+        })),
+        "dock_left" => Ok(json!({
+            "ok": true,
+            "spot": "dock_left",
+            "x": -48.0,
+            "y": ((logical_h - actor_size) * 0.48).max(0.0).round()
+        })),
+        "dock_right" => Ok(json!({
+            "ok": true,
+            "spot": "dock_right",
+            "x": (logical_w - actor_size + 48.0).round(),
+            "y": ((logical_h - actor_size) * 0.48).max(0.0).round()
+        })),
+        "bottom_left" => Ok(json!({
+            "ok": true,
+            "spot": "bottom_left",
+            "x": 20.0,
+            "y": (logical_h - actor_size - 48.0).max(0.0).round()
+        })),
+        "sit_floor" => Ok(json!({
+            "ok": true,
+            "spot": "sit_floor",
+            "x": (logical_w - actor_size - 190.0).max(24.0).round(),
+            "y": (logical_h - actor_size - 48.0).max(0.0).round()
+        })),
+        _ => move_to_bottom_right(window),
     }
 }
 
@@ -276,10 +276,17 @@ async fn run_static_asset_server(std_listener: std::net::TcpListener, assets_dir
                 return;
             };
             let req = String::from_utf8_lossy(&buf[..n]);
-            let path_part = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
+            let first_line = req.lines().next().unwrap_or("");
+            let method = first_line.split_whitespace().next().unwrap_or("GET");
+            if method == "OPTIONS" {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                return;
+            }
+            let path_part = first_line
+                .split_whitespace()
+                .nth(1)
                 .unwrap_or("/")
                 .split('?')
                 .next()
@@ -302,6 +309,10 @@ async fn run_static_asset_server(std_listener: std::net::TcpListener, assets_dir
                         "audio/mpeg"
                     } else if rel.ends_with(".webp") {
                         "image/webp"
+                    } else if rel.ends_with(".svg") {
+                        "image/svg+xml"
+                    } else if rel.ends_with(".mjs") || rel.ends_with(".js") {
+                        "text/javascript; charset=utf-8"
                     } else {
                         "application/octet-stream"
                     };
@@ -382,50 +393,120 @@ pub fn run() {
                 }
             }
             let main_win = app.get_webview_window("main").unwrap();
-            let scale = main_win.scale_factor().unwrap_or(1.0);
-            let win_w = (360.0 * scale).round() as i32;
-            let win_h = (420.0 * scale).round() as i32;
             let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
-            let _ = main_win.set_position(PhysicalPosition::new(
-                (screen_w - win_w - 18).max(0),
-                (screen_h - win_h - 46).max(0),
-            ));
+            let stage_w = (screen_w as u32).max(800);
+            let stage_h = ((screen_h - 1).max(600)) as u32;
+            let _ = main_win.set_position(PhysicalPosition::new(0, 0));
+            let _ = main_win.set_size(Size::Physical(PhysicalSize::new(stage_w, stage_h)));
+            let _ = main_win.set_ignore_cursor_events(true);
 
-            // Background 30Hz cursor hit-test loop so transparent margins click straight through
+            // Background 30Hz cursor hit-test + hotkey + human laptop telemetry loop
             let rects_ref = Arc::clone(&hit_rects);
             let lock_ref = Arc::clone(&click_through_locked);
             let drag_ref = Arc::clone(&dragging_active);
             let win_clone = main_win.clone();
             std::thread::spawn(move || {
-                let mut last_ignored = false;
+                let mut last_ignored = true;
+                let mut last_cx = f64::NAN;
+                let mut last_cy = f64::NAN;
+                let mut tick_count: u64 = 0;
+                let mut last_hotkey_down = false;
+                let mut last_hotkey_at = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(std::time::Instant::now);
+
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(32));
-                    if drag_ref.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    let Some((cx, cy)) = win_auto::get_cursor_physical_pos() else {
-                        continue;
-                    };
-                    let Ok(pos) = win_clone.outer_position() else {
-                        continue;
-                    };
+                    tick_count = tick_count.wrapping_add(1);
+
                     let sf = win_clone.scale_factor().unwrap_or(1.0);
-                    let lx = (cx - pos.x) as f64 / sf;
-                    let ly = (cy - pos.y) as f64 / sf;
+                    let logical_w = (screen_w as f64) / sf;
+                    let logical_h = ((screen_h - 1).max(600) as f64) / sf;
 
-                    let inside = if let Ok(rects) = rects_ref.lock() {
-                        rects.is_empty()
-                            || rects
-                                .iter()
-                                .any(|r| lx >= r.x && lx <= r.x + r.w && ly >= r.y && ly <= r.y + r.h)
-                    } else {
-                        true
-                    };
+                    if let Some((cx, cy)) = win_auto::get_cursor_physical_pos() {
+                        let lx = if let Ok(pos) = win_clone.outer_position() {
+                            (cx - pos.x) as f64 / sf
+                        } else {
+                            (cx as f64) / sf
+                        };
+                        let ly = if let Ok(pos) = win_clone.outer_position() {
+                            (cy - pos.y) as f64 / sf
+                        } else {
+                            (cy as f64) / sf
+                        };
 
-                    let should_ignore = !inside && !lock_ref.load(Ordering::Relaxed);
-                    if should_ignore != last_ignored {
-                        let _ = win_clone.set_ignore_cursor_events(should_ignore);
-                        last_ignored = should_ignore;
+                        let moved = last_cx.is_nan()
+                            || (lx - last_cx).abs() >= 2.0
+                            || (ly - last_cy).abs() >= 2.0;
+                        if moved || tick_count % 4 == 0 {
+                            let _ = win_clone.emit(
+                                "capri-cursor",
+                                json!({
+                                    "x": lx,
+                                    "y": ly,
+                                    "screenW": logical_w,
+                                    "screenH": logical_h,
+                                }),
+                            );
+                            last_cx = lx;
+                            last_cy = ly;
+                        }
+
+                        if !drag_ref.load(Ordering::Relaxed) {
+                            let inside = if let Ok(rects) = rects_ref.lock() {
+                                !rects.is_empty()
+                                    && rects
+                                        .iter()
+                                        .any(|r| lx >= r.x && lx <= r.x + r.w && ly >= r.y && ly <= r.y + r.h)
+                            } else {
+                                false
+                            };
+
+                            let should_ignore = !inside && !lock_ref.load(Ordering::Relaxed);
+                            if should_ignore != last_ignored {
+                                let _ = win_clone.set_ignore_cursor_events(should_ignore);
+                                last_ignored = should_ignore;
+                            }
+                        }
+
+                        let hotkey_down = win_auto::is_summon_hotkey_pressed();
+                        if hotkey_down
+                            && !last_hotkey_down
+                            && last_hotkey_at.elapsed() >= std::time::Duration::from_millis(700)
+                        {
+                            last_hotkey_at = std::time::Instant::now();
+                            let _ = win_clone.emit(
+                                "capri-summon",
+                                json!({
+                                    "source": "hotkey",
+                                    "cursorX": lx,
+                                    "cursorY": ly,
+                                }),
+                            );
+                        }
+                        last_hotkey_down = hotkey_down;
+                    }
+
+                    if tick_count % 48 == 0 {
+                        let snap = win_auto::sample_foreground_and_system();
+                        let _ = win_clone.emit(
+                            "capri-activity",
+                            json!({
+                                "fgTitle": snap.fg_title,
+                                "fgExe": snap.fg_exe,
+                                "fgRect": {
+                                    "x": (snap.fg_x as f64) / sf,
+                                    "y": (snap.fg_y as f64) / sf,
+                                    "w": (snap.fg_w as f64) / sf,
+                                    "h": (snap.fg_h as f64) / sf,
+                                },
+                                "fgFullscreen": snap.fg_fullscreen,
+                                "activityMode": snap.activity_mode,
+                                "idleMs": snap.idle_ms,
+                                "batteryPct": snap.battery_pct,
+                                "onAc": snap.on_ac,
+                            }),
+                        );
                     }
                 }
             });

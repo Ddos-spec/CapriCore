@@ -3,22 +3,19 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Capri-RS</title>
+  <title>Capri</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <div id="capri-root">
-    <div id="stage-wrap">
-      <div id="sprite-box" title="Drag untuk pindah | Elus kepala Capri">
-        <div id="sprite-hit" class="hit-region"></div>
-        <img id="sprite-glitch-r" class="sprite-layer glitch-layer" alt="" draggable="false" />
-        <img id="sprite-glitch-c" class="sprite-layer glitch-layer" alt="" draggable="false" />
-        <img id="sprite-main" class="sprite-layer" alt="Capri" draggable="false" />
-        <div id="headpat-zone" title="Elus kepala Capri"></div>
-        <div id="sparkle-layer"></div>
-      </div>
-    </div>
+  <canvas id="fx-canvas" aria-hidden="true"></canvas>
+  <div id="capri-actor" title="Drag Capri | Elus kepala | Ctrl+Shift+C untuk panggil">
+    <div id="capri-hit" class="hit-region"></div>
+    <img id="capri-source" alt="" aria-hidden="true" crossorigin="anonymous" />
+    <canvas id="capri-gl" width="1254" height="1254"></canvas>
+    <canvas id="capri-overlay" width="1254" height="1254"></canvas>
+    <div id="headpat-zone" title="Elus kepala Capri"></div>
+    <div id="heart-layer" aria-hidden="true"></div>
   </div>
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

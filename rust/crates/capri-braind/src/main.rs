@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 struct AppState {
@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     gemini.spawn_rotation_task();
 
     let voice = Arc::new(VoiceEngine::new()?);
+    voice.warm_start().await;
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -201,8 +202,25 @@ async fn chat_completions_handler(
         }
     };
 
-    let clean_reply = strip_citations_and_artifacts(&raw_reply);
+    let mut clean_reply = strip_citations_and_artifacts(&raw_reply);
     let tool_calls = parse_tool_calls(&clean_reply, &allowed_tools);
+    if tool_calls.is_none() && capri_core::looks_like_refusal(&clean_reply) {
+        warn!("Gemini returned refusal ({:?}); retrying lean tool-free turn", clean_reply.chars().take(60).collect::<String>());
+        let lean_msgs: Vec<_> = req
+            .messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .cloned()
+            .collect();
+        let start = lean_msgs.len().saturating_sub(6);
+        let (retry_prompt, _, _, _) = build_gemini_prompt(&lean_msgs[start..], None, &recalled);
+        if let Ok(retry_raw) = st.gemini.generate(&retry_prompt, Vec::new(), true).await {
+            let retry_clean = strip_citations_and_artifacts(&retry_raw);
+            if !retry_clean.is_empty() && !capri_core::looks_like_refusal(&retry_clean) {
+                clean_reply = retry_clean;
+            }
+        }
+    }
     info!(
         "CHAT user={:?} -> tools={} reply={:?}",
         latest_user.chars().take(60).collect::<String>(),

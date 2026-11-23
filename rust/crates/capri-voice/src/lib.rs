@@ -4,7 +4,7 @@ use flacenc::component::BitRepr;
 use flacenc::error::Verify;
 use flacenc::source::MemSource;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -15,6 +15,9 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -22,8 +25,125 @@ pub const TARGET_TTS_SAMPLE_RATE: u32 = 24_000;
 const GOOGLE_STT_DEFAULT_KEY: &str = "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw";
 const MAX_TTS_BYTES: usize = (TARGET_TTS_SAMPLE_RATE as usize) * 2 * 45;
 
+const EDGE_WORKER_PY: &str = r#"
+import asyncio, json, sys, edge_tts
+
+async def main():
+    print(json.dumps({"ready": True}), flush=True)
+    loop = asyncio.get_running_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            comm = edge_tts.Communicate(
+                req["text"],
+                req["voice"],
+                rate=req.get("rate", "+14%"),
+                pitch=req.get("pitch", "+6Hz"),
+            )
+            await comm.save(req["out"])
+            print(json.dumps({"ok": True}), flush=True)
+        except Exception as e:
+            print(json.dumps({"ok": False, "err": str(e)}), flush=True)
+
+asyncio.run(main())
+"#;
+
+struct EdgeTtsWorker {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl EdgeTtsWorker {
+    async fn spawn(python_bin: &PathBuf) -> Result<Self> {
+        let mut cmd = tokio::process::Command::new(python_bin);
+        cmd.arg("-u")
+            .arg("-c")
+            .arg(EDGE_WORKER_PY)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(target_os = "windows")]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd.spawn().context("failed spawning persistent edge-tts python worker")?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("missing worker stdin"))?;
+        let stdout_raw = child.stdout.take().ok_or_else(|| anyhow!("missing worker stdout"))?;
+        let mut stdout = BufReader::new(stdout_raw);
+
+        let mut ready_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            stdout.read_line(&mut ready_line),
+        )
+        .await
+        .context("edge-tts worker startup timeout")??;
+        if !ready_line.contains("ready") {
+            return Err(anyhow!("edge-tts worker unexpected startup line: {}", ready_line.trim()));
+        }
+
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout,
+        })
+    }
+
+    async fn synthesize(&mut self, text: &str, voice: &str, rate: &str, pitch: &str) -> Result<Vec<u8>> {
+        let tmp_path = std::env::temp_dir().join(format!("capri-tts-w-{}.mp3", Uuid::new_v4()));
+        let req = json!({
+            "text": text,
+            "voice": voice,
+            "rate": rate,
+            "pitch": pitch,
+            "out": tmp_path.display().to_string(),
+        });
+        let mut line = serde_json::to_string(&req)?;
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await?;
+        self.stdin.flush().await?;
+
+        let mut resp_line = String::new();
+        let read_res = tokio::time::timeout(
+            std::time::Duration::from_secs(14),
+            self.stdout.read_line(&mut resp_line),
+        )
+        .await;
+        if read_res.is_err() || resp_line.is_empty() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(anyhow!("edge-tts worker timeout or closed pipe"));
+        }
+
+        let val: Value = serde_json::from_str(resp_line.trim())
+            .with_context(|| format!("invalid edge-tts worker json: {}", resp_line.trim()))?;
+        let mp3_res = std::fs::read(&tmp_path);
+        let _ = std::fs::remove_file(&tmp_path);
+
+        if val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let err_msg = val.get("err").and_then(|v| v.as_str()).unwrap_or("unknown");
+            return Err(anyhow!("edge-tts worker error: {}", err_msg));
+        }
+
+        let bytes = mp3_res.context("failed reading warm edge-tts temp output")?;
+        if bytes.is_empty() {
+            return Err(anyhow!("warm edge-tts produced 0 bytes"));
+        }
+        Ok(bytes)
+    }
+}
+
 pub struct VoiceEngine {
     http: reqwest::Client,
+    worker: Mutex<Option<EdgeTtsWorker>>,
 }
 
 impl VoiceEngine {
@@ -33,7 +153,54 @@ impl VoiceEngine {
             .http1_only()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            worker: Mutex::new(None),
+        })
+    }
+
+    /// Warm up the persistent Python Edge-TTS worker so first voice reply avoids Python cold-start delay.
+    pub async fn warm_start(&self) {
+        if let Some(py) = find_edge_tts_python() {
+            let mut guard = self.worker.lock().await;
+            if guard.is_none() {
+                match EdgeTtsWorker::spawn(&py).await {
+                    Ok(w) => {
+                        info!("Warm Edge-TTS worker ready via {}", py.display());
+                        *guard = Some(w);
+                    }
+                    Err(e) => warn!("Warm Edge-TTS worker failed to start: {}", e),
+                }
+            }
+        }
+    }
+
+    async fn synthesize_edge_warm(&self, text: &str, voice: &str, speed: f32) -> Result<Vec<u8>> {
+        let py = find_edge_tts_python().ok_or_else(|| anyhow!("edge-tts python runtime not found"))?;
+        let pct = ((speed - 1.0) * 100.0).round() as i32 + 14;
+        let rate_arg = if pct >= 0 {
+            format!("+{}%", pct)
+        } else {
+            format!("{}%", pct)
+        };
+
+        let mut guard = self.worker.lock().await;
+        if guard.is_none() {
+            *guard = Some(EdgeTtsWorker::spawn(&py).await?);
+        }
+        if let Some(worker) = guard.as_mut() {
+            match worker.synthesize(text, voice, &rate_arg, "+6Hz").await {
+                Ok(mp3) => return Ok(mp3),
+                Err(first_err) => {
+                    warn!("Warm Edge-TTS attempt failed ({}), respawning worker", first_err);
+                    *guard = None;
+                }
+            }
+        }
+        let mut fresh = EdgeTtsWorker::spawn(&py).await?;
+        let mp3 = fresh.synthesize(text, voice, &rate_arg, "+6Hz").await?;
+        *guard = Some(fresh);
+        Ok(mp3)
     }
 
     /// Synthesize speech into strict 24 kHz 16-bit mono PCM WAV matching CapriCore's external-tts contract.
@@ -51,11 +218,17 @@ impl VoiceEngine {
         let target_voice = voice.unwrap_or("id-ID-GadisNeural");
         let spd = speed.unwrap_or(1.0).clamp(0.6, 1.8);
 
-        let decoded_mono = match try_edge_tts(&clean, target_voice, spd).await {
+        let decoded_mono = match self.synthesize_edge_warm(&clean, target_voice, spd).await {
             Ok(mp3) => decode_mp3_to_24k_mono(&mp3)?,
-            Err(edge_err) => {
-                warn!("edge-tts unavailable/failed ({}), falling back to Google translate_tts", edge_err);
-                self.google_translate_tts_24k(&clean, target_voice).await?
+            Err(warm_err) => {
+                debug!("warm edge-tts skipped/failed ({}), trying CLI fallback", warm_err);
+                match try_edge_tts(&clean, target_voice, spd).await {
+                    Ok(mp3) => decode_mp3_to_24k_mono(&mp3)?,
+                    Err(edge_err) => {
+                        warn!("edge-tts unavailable/failed ({}), falling back to Google translate_tts", edge_err);
+                        self.google_translate_tts_24k(&clean, target_voice).await?
+                    }
+                }
             }
         };
 
@@ -98,6 +271,10 @@ impl VoiceEngine {
         }
 
         let (flac_bytes, sample_rate, peak) = convert_audio_to_flac(audio_bytes)?;
+        if flac_bytes.is_empty() {
+            debug!("STT rejected low-energy noise WAV {}B sr={} peak={:.4}", audio_bytes.len(), sample_rate, peak);
+            return Ok(String::new());
+        }
         let stt_lang = if lang.trim().is_empty() { "id-ID" } else { lang.trim() };
         let key = std::env::var("CAPRI_GOOGLE_STT_KEY").unwrap_or_else(|_| GOOGLE_STT_DEFAULT_KEY.to_string());
 
@@ -132,6 +309,32 @@ impl VoiceEngine {
         );
         Ok(transcript)
     }
+}
+
+fn find_edge_tts_python() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("CAPRI_EDGE_TTS_PYTHON") {
+        let p = PathBuf::from(custom);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(home).join(".capri-rs/venv/bin/python3");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(bin) = find_edge_tts_bin() {
+        if let Some(dir) = bin.parent() {
+            for name in ["python3", "python.exe", "python"] {
+                let sibling = dir.join(name);
+                if sibling.exists() {
+                    return Some(sibling);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn find_edge_tts_bin() -> Option<PathBuf> {
@@ -344,8 +547,11 @@ fn convert_audio_to_flac(bytes: &[u8]) -> Result<(Vec<u8>, u32, f32)> {
         };
 
         let peak = mono.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
-        if peak > 0.002 && peak < 0.70 {
-            let gain = (0.85 / peak).min(24.0);
+        if peak < 0.008 {
+            return Ok((Vec::new(), target_rate, peak));
+        }
+        if peak >= 0.008 && peak < 0.70 {
+            let gain = (0.85 / peak).min(10.0);
             for s in &mut mono {
                 *s = (*s * gain).clamp(-1.0, 1.0);
             }
