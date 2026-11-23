@@ -15,7 +15,7 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub const TARGET_TTS_SAMPLE_RATE: u32 = 24_000;
@@ -97,7 +97,7 @@ impl VoiceEngine {
             return Ok(String::new());
         }
 
-        let (flac_bytes, sample_rate) = convert_audio_to_flac(audio_bytes)?;
+        let (flac_bytes, sample_rate, peak) = convert_audio_to_flac(audio_bytes)?;
         let stt_lang = if lang.trim().is_empty() { "id-ID" } else { lang.trim() };
         let key = std::env::var("CAPRI_GOOGLE_STT_KEY").unwrap_or_else(|_| GOOGLE_STT_DEFAULT_KEY.to_string());
 
@@ -122,7 +122,15 @@ impl VoiceEngine {
             return Err(anyhow!("Google Speech API status {}: {}", status, body));
         }
 
-        parse_google_stt_ndjson(&body)
+        let transcript = parse_google_stt_ndjson(&body)?;
+        info!(
+            "STT {}B sr={} peak={:.4} -> {:?}",
+            audio_bytes.len(),
+            sample_rate,
+            peak,
+            transcript
+        );
+        Ok(transcript)
     }
 }
 
@@ -148,7 +156,7 @@ fn find_edge_tts_bin() -> Option<PathBuf> {
 async fn try_edge_tts(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>> {
     let bin = find_edge_tts_bin().ok_or_else(|| anyhow!("edge-tts binary not found"))?;
     let tmp_path = std::env::temp_dir().join(format!("capri-tts-{}.mp3", Uuid::new_v4()));
-    let pct = ((speed - 1.0) * 100.0).round() as i32;
+    let pct = ((speed - 1.0) * 100.0).round() as i32 + 14;
     let rate_arg = if pct >= 0 {
         format!("+{}%", pct)
     } else {
@@ -158,8 +166,8 @@ async fn try_edge_tts(text: &str, voice: &str, speed: f32) -> Result<Vec<u8>> {
     let output = tokio::process::Command::new(&bin)
         .arg("--voice")
         .arg(voice)
-        .arg("--rate")
-        .arg(&rate_arg)
+        .arg(format!("--rate={}", rate_arg))
+        .arg("--pitch=+6Hz")
         .arg("--text")
         .arg(text)
         .arg("--write-media")
@@ -299,15 +307,15 @@ fn encode_wav_24k(samples: &[i16]) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-fn convert_audio_to_flac(bytes: &[u8]) -> Result<(Vec<u8>, u32)> {
+fn convert_audio_to_flac(bytes: &[u8]) -> Result<(Vec<u8>, u32, f32)> {
     // Case 1: Already FLAC
     if bytes.starts_with(b"fLaC") && bytes.len() >= 22 {
         let sr = (((bytes[18] as u32) << 12) | ((bytes[19] as u32) << 4) | ((bytes[20] as u32) >> 4))
             .max(8000);
-        return Ok((bytes.to_vec(), sr));
+        return Ok((bytes.to_vec(), sr, 1.0));
     }
 
-    // Case 2: RIFF/WAVE -> pure-Rust decode via hound + pure-Rust FLAC encode via flacenc
+    // Case 2: RIFF/WAVE -> pure-Rust decode via hound + peak normalize + pure-Rust FLAC encode via flacenc
     if bytes.starts_with(b"RIFF") {
         let mut reader = hound::WavReader::new(Cursor::new(bytes))?;
         let spec = reader.spec();
@@ -329,11 +337,19 @@ fn convert_audio_to_flac(bytes: &[u8]) -> Result<(Vec<u8>, u32)> {
         };
 
         let target_rate = if spec.sample_rate < 8000 { 16_000 } else { spec.sample_rate };
-        let mono = if target_rate != spec.sample_rate {
+        let mut mono = if target_rate != spec.sample_rate {
             resample_linear(&raw_mono, spec.sample_rate, target_rate)
         } else {
             raw_mono
         };
+
+        let peak = mono.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
+        if peak > 0.002 && peak < 0.70 {
+            let gain = (0.85 / peak).min(24.0);
+            for s in &mut mono {
+                *s = (*s * gain).clamp(-1.0, 1.0);
+            }
+        }
 
         let i32_samples: Vec<i32> = mono
             .into_iter()
@@ -350,8 +366,8 @@ fn convert_audio_to_flac(bytes: &[u8]) -> Result<(Vec<u8>, u32)> {
         flac_stream
             .write(&mut sink)
             .map_err(|e| anyhow!("flacenc ByteSink write error: {:?}", e))?;
-        debug!("Encoded WAV {}Hz -> FLAC {} bytes", target_rate, sink.as_slice().len());
-        return Ok((sink.as_slice().to_vec(), target_rate));
+        debug!("Encoded WAV {}Hz peak={:.4} -> FLAC {} bytes", target_rate, peak, sink.as_slice().len());
+        return Ok((sink.as_slice().to_vec(), target_rate, peak));
     }
 
     // Case 3: WebM/Ogg/MP3 -> convert via ffmpeg subprocess if present
@@ -376,7 +392,7 @@ fn convert_audio_to_flac(bytes: &[u8]) -> Result<(Vec<u8>, u32)> {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("ffmpeg conversion to FLAC failed: {}", err));
     }
-    Ok((output.stdout, 16_000))
+    Ok((output.stdout, 16_000, 1.0))
 }
 
 fn parse_google_stt_ndjson(body: &str) -> Result<String> {

@@ -30,20 +30,22 @@ pub struct UiState {
 
 #[tauri::command]
 fn get_runtime_config(state: State<'_, UiState>) -> Value {
-    let manifest_path = state
-        .assets_dir
-        .join("capri/sprites/v1/runtime-sprite-set.json");
-    let manifest: Value = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({ "sprites": [] }));
+    let load_json = |rel: &str, fallback: Value| -> Value {
+        let p = state.assets_dir.join(rel);
+        std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(fallback)
+    };
 
     json!({
         "brainUrl": state.brain_url,
         "brainMode": state.brain_mode,
         "assetBaseUrl": state.asset_base_url,
         "assetsDir": state.assets_dir.display().to_string(),
-        "manifest": manifest,
+        "manifest": load_json("capri/sprites/v1/runtime-sprite-set.json", json!({ "sprites": [] })),
+        "intro": load_json("capri/intro-v1/runtime-intro.json", json!({ "frames": [] })),
+        "poses": load_json("capri/sprites/poses-v2/runtime-poses.json", json!({ "sprites": [] })),
         "fullAccess": true
     })
 }
@@ -125,6 +127,55 @@ fn move_to_bottom_right(window: tauri::WebviewWindow) -> Result<Value, String> {
         .set_position(PhysicalPosition::new(x, y))
         .map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "x": x, "y": y }))
+}
+
+#[tauri::command]
+fn move_to_spot(window: tauri::WebviewWindow, spot: String) -> Result<Value, String> {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let win_w = (360.0 * scale).round() as i32;
+    let win_h = (420.0 * scale).round() as i32;
+    let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
+
+    match spot.as_str() {
+        "perch" => return auto_perch_window(window),
+        "ceiling" => {
+            let x = ((screen_w - win_w) / 2).max(0);
+            let y = -((24.0 * scale).round() as i32);
+            window
+                .set_position(PhysicalPosition::new(x, y))
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({ "ok": true, "spot": "ceiling", "x": x, "y": y }));
+        }
+        "dock_left" => {
+            let x = -((48.0 * scale).round() as i32);
+            let y = ((screen_h - win_h) / 2).max(0);
+            window
+                .set_position(PhysicalPosition::new(x, y))
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({ "ok": true, "spot": "dock_left", "x": x, "y": y }));
+        }
+        "dock_right" => {
+            let x = screen_w - win_w + ((48.0 * scale).round() as i32);
+            let y = ((screen_h - win_h) / 2).max(0);
+            window
+                .set_position(PhysicalPosition::new(x, y))
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({ "ok": true, "spot": "dock_right", "x": x, "y": y }));
+        }
+        "bottom_left" | "sit_floor" => {
+            let x = if spot == "bottom_left" {
+                (22.0 * scale).round() as i32
+            } else {
+                (screen_w - win_w - 220).max(24)
+            };
+            let y = (screen_h - win_h - 46).max(0);
+            window
+                .set_position(PhysicalPosition::new(x, y))
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({ "ok": true, "spot": spot, "x": x, "y": y }));
+        }
+        _ => return move_to_bottom_right(window),
+    }
 }
 
 #[tauri::command]
@@ -317,6 +368,7 @@ pub fn run() {
             exec_desktop_action,
             auto_perch_window,
             move_to_bottom_right,
+            move_to_spot,
             quit_app,
         ])
         .setup(move |app| {

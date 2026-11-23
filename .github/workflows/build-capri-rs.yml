@@ -16,7 +16,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: |
+            rust
+            rust/apps/capri-ui
       - name: Check Rust brain workspace
         run: cargo check --workspace --manifest-path rust/Cargo.toml
 
@@ -27,7 +29,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: |
+            rust
+            rust/apps/capri-ui
       - name: Build capri-braind (Windows fallback)
         run: cargo build --release --manifest-path rust/Cargo.toml -p capri-braind
       - name: Build capri-ui (Tauri v2 companion)

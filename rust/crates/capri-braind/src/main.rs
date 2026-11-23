@@ -203,6 +203,12 @@ async fn chat_completions_handler(
 
     let clean_reply = strip_citations_and_artifacts(&raw_reply);
     let tool_calls = parse_tool_calls(&clean_reply, &allowed_tools);
+    info!(
+        "CHAT user={:?} -> tools={} reply={:?}",
+        latest_user.chars().take(60).collect::<String>(),
+        tool_calls.as_ref().map(|v| v.len()).unwrap_or(0),
+        clean_reply.chars().take(80).collect::<String>()
+    );
 
     // Persist notable user memories passively in SQLite
     if latest_user.len() >= 18 && !latest_user.starts_with('[') && tool_calls.is_none() {
@@ -324,14 +330,17 @@ async fn audio_speech_handler(
 ) -> Response {
     let voice = req.voice.as_deref().unwrap_or(&st.config.tts_voice);
     match st.voice.synthesize_wav_24k(&req.input, Some(voice), req.speed).await {
-        Ok(wav) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "audio/wav")
-            .header("X-Sample-Rate", HeaderValue::from_static("24000"))
-            .header("X-Channels", HeaderValue::from_static("1"))
-            .header("X-Bits-Per-Sample", HeaderValue::from_static("16"))
-            .body(Body::from(wav))
-            .unwrap(),
+        Ok(wav) => {
+            info!("TTS len={} voice={} -> {}B", req.input.len(), voice, wav.len());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "audio/wav")
+                .header("X-Sample-Rate", HeaderValue::from_static("24000"))
+                .header("X-Channels", HeaderValue::from_static("1"))
+                .header("X-Bits-Per-Sample", HeaderValue::from_static("16"))
+                .body(Body::from(wav))
+                .unwrap()
+        }
         Err(e) => {
             error!("TTS synthesis failed: {}", e);
             (
