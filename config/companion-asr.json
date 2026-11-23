@@ -13,7 +13,7 @@
   "autoSend": true,
   "bargeIn": true,
   "wakeWord": {
-    "enabled": true,
+    "enabled": false,
     "commandWindowMs": 10000,
     "ambiguityHoldMs": 120
   },

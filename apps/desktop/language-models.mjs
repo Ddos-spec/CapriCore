@@ -101,6 +101,7 @@ export function speechModelsInstalled(root, language) {
 
 export function recognitionModelsInstalled(root, language, config) {
   if (language === 'off') return false;
+  if (existsSync(path.join(root, 'packages/runtime/bin/asr-bridge-worker.mjs'))) return true;
   try {
     const complete = (directory, files) =>
       files.length > 0 &&

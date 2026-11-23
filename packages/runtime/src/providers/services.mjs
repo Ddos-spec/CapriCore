@@ -39,7 +39,10 @@ async function startLocalLlama(
     `llama-${settings.llamaVersion}-vulkan`,
     'llama-server.exe',
   );
-  if (!llamaPath || (llamaPath === bundled && !llamaBundleReady(bundled)))
+  const useRemoteEmbedShim =
+    Boolean(rt.remote?.enabled) &&
+    (!llamaPath || (llamaPath === bundled && !llamaBundleReady(bundled)));
+  if (!useRemoteEmbedShim && (!llamaPath || (llamaPath === bundled && !llamaBundleReady(bundled))))
     throw Object.assign(
       new Error('The llama.cpp runtime is missing or incomplete. Run Capri Setup to repair it.'),
       { code: 'CAPRI_LLAMA_BUNDLE_INCOMPLETE' },
@@ -96,6 +99,15 @@ async function startLocalLlama(
         code: 'CAPRI_SERVICE_PORT_OCCUPIED',
       },
     );
+  }
+  if (useRemoteEmbedShim) {
+    await launch('llama', nodePath, [path.join(root, 'packages/runtime/bin/embed-shim.mjs')], rt, {
+      env: {
+        CAPRI_LLAMA_CONFIGURATION: configuration,
+      },
+      deviceKey: 'cpu',
+    });
+    return waitForOwnedService(health, { name: 'llama', label: 'capri-embed-shim', signal, timeout: 15000 });
   }
   const id = preferences.language;
   const explicit = id !== 'auto' && id !== 'cpu' && !id.startsWith('npu-');

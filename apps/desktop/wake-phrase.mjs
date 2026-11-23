@@ -1,5 +1,5 @@
 /** Attention gate over accurate Parakeet results; no inference or recordings here. */
-const greetings = new Set(['hey', 'hay', 'hi', 'эй', 'хей', 'хэй', 'эи', 'хеи', 'хэи']);
+const greetings = new Set(['hey', 'hay', 'hi', 'halo', 'hallo', 'hai', 'hei', 'эй', 'хей', 'хэй', 'эи', 'хеи', 'хэи']);
 const weakGreetings = new Set(['a', 'ay', 'eh', 'he', 'okay', 'ok']);
 const tokens = (text) =>
   [...text.matchAll(/[\p{L}\p{N}]+/gu)].slice(0, 256).map((match) => ({

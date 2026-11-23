@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { LANGUAGE_PACKS } from './renderer/language-settings.mjs';
+import { nodePath } from '../../packages/runtime/src/host/executables.mjs';
 
 const reportedStartupCodes = new Set([
   'ASR_START_DEPENDENCIES',
@@ -78,7 +79,14 @@ export class ASRWorker extends EventEmitter {
   async startAttempt(safeStartup = false) {
     if (this.ready) return this.ready;
     const python = path.join(this.root, '.runtime/asr-venv/Scripts/python.exe');
-    if (!existsSync(python)) throw asrError('ASR_START_PYTHON');
+    const nodeBridge = path.join(this.root, 'packages/runtime/bin/asr-bridge-worker.mjs');
+    const useNodeBridge = !existsSync(python) && existsSync(nodeBridge);
+    if (!existsSync(python) && !useNodeBridge) throw asrError('ASR_START_PYTHON');
+    const bridgeNode =
+      nodePath ||
+      process.env.CAPRI_NODE_PATH ||
+      path.join(this.root, '.runtime/node-v24.22.1-win-x64/node.exe');
+    if (useNodeBridge && !existsSync(bridgeNode)) throw asrError('ASR_START_PYTHON');
     const env = Object.fromEntries(
       ['SystemRoot', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA']
         .filter((name) => process.env[name])
@@ -98,19 +106,26 @@ export class ASRWorker extends EventEmitter {
       throw asrError('ASR_START_CONFIG');
     Object.assign(env, { HF_HUB_OFFLINE: '1', TOKENIZERS_PARALLELISM: 'false' });
     env.CAPRI_ASR_LANGUAGE = this.language;
-    const child = (this.child = this.spawnImpl(
-      python,
-      [
-        '-I',
-        '-S',
-        '-X',
-        'utf8',
-        '-B',
-        '-u',
-        path.join(this.root, 'integrations/asr_runtime/bootstrap.py'),
-      ],
-      { cwd: this.root, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
-    ));
+    const child = (this.child = useNodeBridge
+      ? this.spawnImpl(bridgeNode, [nodeBridge], {
+          cwd: this.root,
+          env,
+          windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+      : this.spawnImpl(
+          python,
+          [
+            '-I',
+            '-S',
+            '-X',
+            'utf8',
+            '-B',
+            '-u',
+            path.join(this.root, 'integrations/asr_runtime/bootstrap.py'),
+          ],
+          { cwd: this.root, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
+        ));
     let readyResolve,
       readyReject,
       startupStage,

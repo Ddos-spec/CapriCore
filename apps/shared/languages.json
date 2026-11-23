@@ -324,7 +324,7 @@
     "name": "Indonesian",
     "label": "Indonesian",
     "recognizer": "whisper",
-    "speech": false,
+    "speech": true,
     "interface": true
   },
   {
