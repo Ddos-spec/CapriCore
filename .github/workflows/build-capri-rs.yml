@@ -1,0 +1,46 @@
+name: Build Capri-RS
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/build-capri-rs.yml'
+  workflow_dispatch:
+
+jobs:
+  check-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Check Rust brain workspace
+        run: cargo check --workspace --manifest-path rust/Cargo.toml
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build capri-braind (Windows fallback)
+        run: cargo build --release --manifest-path rust/Cargo.toml -p capri-braind
+      - name: Build capri-ui (Tauri v2 companion)
+        run: cargo build --release --manifest-path rust/apps/capri-ui/Cargo.toml
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item rust/target/release/capri-braind.exe dist/
+          Copy-Item rust/apps/capri-ui/target/release/capri-ui.exe dist/
+      - name: Upload Capri-RS Windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: capri-rs-windows-x64
+          path: dist/*.exe
+          if-no-files-found: error

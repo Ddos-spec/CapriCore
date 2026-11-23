@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Capri-RS</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="capri-root">
+    <!-- Floating Holographic Speech Bubble -->
+    <div id="bubble-wrap" class="hit-region hidden">
+      <div id="speech-bubble">
+        <div class="bubble-meta">
+          <span id="bubble-badge">CAPRI // READY</span>
+          <button id="btn-bubble-close" title="Tutup">×</button>
+        </div>
+        <div id="bubble-text"></div>
+      </div>
+    </div>
+
+    <!-- Character Holo Stage -->
+    <div id="stage-wrap">
+      <canvas id="fft-canvas" width="420" height="420"></canvas>
+      <div id="sprite-box" class="hit-region" title="Drag untuk pindah | Elus kepala Capri">
+        <div id="holo-aura"></div>
+        <img id="sprite-glitch-r" class="sprite-layer glitch-layer" alt="" draggable="false" />
+        <img id="sprite-glitch-c" class="sprite-layer glitch-layer" alt="" draggable="false" />
+        <img id="sprite-main" class="sprite-layer" alt="Capri" draggable="false" />
+        <div id="headpat-zone" title="Elus kepala Capri"></div>
+        <div id="sparkle-layer"></div>
+      </div>
+    </div>
+
+    <!-- Sleek Cyber Glass Control Dock -->
+    <div id="hud-dock" class="hit-region">
+      <div class="dock-top">
+        <div class="brain-pill" id="brain-pill" title="Status koneksi Brain">
+          <span class="dot" id="brain-dot"></span>
+          <span id="brain-label">SYNC</span>
+        </div>
+        <button id="btn-mic" class="dock-btn" title="Mode suara hands-free (Halo-Halo VAD)">
+          <span class="btn-icon">🎙</span><span class="btn-txt">MIC</span>
+        </button>
+        <button id="btn-vision" class="dock-btn" title="Capture & analisa layar sekarang">
+          <span class="btn-icon">👁</span><span class="btn-txt">LIHAT</span>
+        </button>
+        <button id="btn-perch" class="dock-btn" title="Teleport ke sudut window aktif (Klik kanan: kembali)">
+          <span class="btn-icon">⚡</span><span class="btn-txt">PERCH</span>
+        </button>
+        <button id="btn-fx" class="dock-btn" title="Ganti efek suara DSP">
+          <span id="fx-label">CYBER</span>
+        </button>
+        <button id="btn-mute" class="dock-btn icon-only" title="Mute / Unmute TTS">🔊</button>
+      </div>
+      <form id="chat-form" class="chat-row">
+        <input id="chat-input" type="text" placeholder="Ngobrol atau suruh Capri..." autocomplete="off" />
+        <button id="btn-send" type="submit" title="Kirim">↵</button>
+      </form>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

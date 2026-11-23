@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capri-core",
+    "crates/capri-gemini",
+    "crates/capri-voice",
+    "crates/capri-braind",
+]
+exclude = ["apps/capri-ui"]

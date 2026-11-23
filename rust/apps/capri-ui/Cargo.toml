@@ -1,0 +1,32 @@
+[workspace]
+
+[package]
+name = "capri-ui"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "capri_ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+capri-core = { path = "../../crates/capri-core" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["full"] }
+xcap = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+uiautomation = "0.25"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
