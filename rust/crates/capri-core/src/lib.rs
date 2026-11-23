@@ -226,7 +226,7 @@ pub fn build_gemini_prompt(
     if let Some(tool_list) = tools {
         if !tool_list.is_empty() {
             let mut tool_desc = String::from(
-                "AVAILABLE TOOLS:\nJika kamu PERLU memanggil tool untuk menjawab atau mengontrol desktop, balas HANYA dengan JSON murni tanpa teks tambahan:\n{\"tool_call\": {\"name\": \"<tool_name>\", \"arguments\": {<json_args>}}}\nAtau jika tidak perlu tool, balas langsung ke pengguna dengan teks biasa.\nDaftar tool:\n",
+                "AVAILABLE TOOLS:\nJika permintaan user meminta aksi pada aplikasi pendamping, balas HANYA JSON:\n{\"tool_call\": {\"name\": \"<tool_name>\", \"arguments\": {<json_args>}}}\nAtau jika hanya mengobrol, balas langsung teks lisan biasa.\nDaftar tool:\n",
             );
             for t in tool_list {
                 allowed_tools.push(t.function.name.clone());
@@ -303,11 +303,15 @@ pub fn build_gemini_prompt(
     )
 }
 
-/// Remove Gemini `[cite: ...]` artifacts and tidy whitespace.
+/// Remove Gemini `[cite: ...]` artifacts, spoken markdown asterisks, and tidy whitespace.
 pub fn strip_citations_and_artifacts(input: &str) -> String {
     let re = Regex::new(r"\s*\[cite:[^\]]*\]").unwrap();
-    let cleaned = re.replace_all(input, "");
-    cleaned.trim().to_string()
+    let no_cite = re.replace_all(input, "");
+    let re_bold = Regex::new(r"\*\*([^*\n]+)\*\*").unwrap();
+    let no_bold = re_bold.replace_all(&no_cite, "$1");
+    let re_emph = Regex::new(r"\*([^*\n]{1,60})\*").unwrap();
+    let no_emph = re_emph.replace_all(&no_bold, "$1");
+    no_emph.trim().to_string()
 }
 
 /// Detect canned safety/bot refusal strings so `capri-braind` can retry cleanly without tool schemas.
@@ -324,6 +328,11 @@ pub fn looks_like_refusal(reply: &str) -> bool {
         "tidak dapat melakukan hal itu",
         "i cannot fulfill",
         "i'm not programmed",
+        "saya tidak bisa membantu anda",
+        "saya hanya menghasilkan teks",
+        "sebagai ai",
+        "tidak memiliki tubuh",
+        "tidak dapat mengakses",
     ];
     PATTERNS.iter().any(|p| lower.contains(p))
 }

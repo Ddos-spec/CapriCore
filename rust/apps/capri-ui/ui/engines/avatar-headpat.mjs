@@ -68,8 +68,16 @@ export class AvatarHeadpat {
     this.expressions = new Map();
   }
 
+  ensureFaceSrc() {
+    if (!this.face.getAttribute('src') && assetBaseUrl) {
+      this.face.crossOrigin = 'anonymous';
+      this.face.src = `${assetBaseUrl}/default/capri-headpat.png`;
+    }
+  }
+
   play(sprite, { x, y }, bounds, showFace = true, frameId) {
     if (!sprite || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    this.ensureFaceSrc();
     const pose = avatarPoseLandmarks(frameId);
     // A hearts-only reaction must not install a face plate over the live pose.
     if (showFace && pose?.eyes) this.setFace(sprite, frameId, pose, 'affectionate');
@@ -109,6 +117,7 @@ export class AvatarHeadpat {
   }
 
   refresh() {
+    this.ensureFaceSrc();
     const { pose, sprite, plate, tone } = this;
     if (!plate) return;
     if (this.sourceUrl !== sprite.src) {
@@ -159,7 +168,7 @@ export class AvatarHeadpat {
   }
 
   image(sprite) {
-    return this.sprite === sprite && this.sourceUrl === sprite.src && !this.plate.hidden
+    return this.sprite === sprite && this.sourceUrl === sprite.src && this.plate && !this.plate.hidden
       ? this.plate
       : sprite;
   }

@@ -592,50 +592,57 @@ export function fitChannelsToCanvas(channels, { padding = 3, bounds, points } = 
 }
 export function imageSupportPoints(image) {
   try {
+    const SCAN = 314;
+    const scale = 1254 / SCAN;
     const canvas = document.createElement('canvas');
-    canvas.width = canvas.height = 1254;
+    canvas.width = canvas.height = SCAN;
     const context = canvas.getContext('2d', { willReadFrequently: true });
-    context.drawImage(image, 0, 0, 1254, 1254);
-    const data = context.getImageData(0, 0, 1254, 1254).data,
-      top = new Int32Array(1254).fill(-1),
-      bottom = new Int32Array(1254).fill(-1),
+    context.drawImage(image, 0, 0, SCAN, SCAN);
+    const data = context.getImageData(0, 0, SCAN, SCAN).data,
+      top = new Int32Array(SCAN).fill(-1),
+      bottom = new Int32Array(SCAN).fill(-1),
       points = [];
     let firstRow = -1,
       lastRow = -1,
-      minX = 1254,
+      minX = SCAN,
       maxX = -1,
       minPoint = null,
       maxPoint = null;
-    for (let y = 0; y < 1254; y++) {
+    for (let y = 0; y < SCAN; y++) {
       let first = -1,
         last = -1;
-      for (let x = 0; x < 1254; x++)
-        if (data[(y * 1254 + x) * 4 + 3] > 2) {
+      for (let x = 0; x < SCAN; x++)
+        if (data[(y * SCAN + x) * 4 + 3] > 2) {
           if (first < 0) first = x;
           last = x;
           if (top[x] < 0) top[x] = y;
           bottom[x] = y;
           if (x < minX) {
             minX = x;
-            minPoint = [x, y];
+            minPoint = [Math.round(x * scale), Math.round(y * scale)];
           }
           if (x > maxX) {
             maxX = x;
-            maxPoint = [x, y];
+            maxPoint = [Math.round(x * scale), Math.round(y * scale)];
           }
         }
       if (first >= 0) {
+        const sy = Math.round(y * scale);
+        const sf = Math.round(first * scale);
+        const sl = Math.round(last * scale);
         if (firstRow < 0) {
           firstRow = y;
-          points.push([first, y], [last, y]);
+          points.push([sf, sy], [sl, sy]);
         }
         lastRow = y;
-        if (y % 4 === 0) points.push([first, y], [last, y]);
+        points.push([sf, sy], [sl, sy]);
       }
     }
-    for (let x = 0; x < 1254; x++)
-      if (top[x] >= 0 && (x % 4 === 0 || x === minX || x === maxX || bottom[x] === lastRow))
-        points.push([x, top[x]], [x, bottom[x]]);
+    for (let x = 0; x < SCAN; x++)
+      if (top[x] >= 0) {
+        const sx = Math.round(x * scale);
+        points.push([sx, Math.round(top[x] * scale)], [sx, Math.round(bottom[x] * scale)]);
+      }
     if (minPoint) points.push(minPoint, maxPoint);
     return points.length ? points : null;
   } catch {
@@ -754,18 +761,40 @@ export function createRenderer(canvas, images = {}, { grid = 180 } = {}) {
   const indexBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+  const MAX_GL_TEXTURES = 8;
   const cache = new WeakMap(),
-    allTextures = [],
+    allTextures = new Set(),
+    texLru = [],
     textureSupport = new Map(),
     srcSupportCache = new Map();
+  const touchLru = (entry) => {
+    const idx = texLru.findIndex((item) => item.tex === entry.tex);
+    if (idx >= 0) texLru.splice(idx, 1);
+    texLru.push(entry);
+    while (texLru.length > MAX_GL_TEXTURES) {
+      const evicted = texLru.shift();
+      gl.deleteTexture(evicted.tex);
+      allTextures.delete(evicted.tex);
+      textureSupport.delete(evicted.tex);
+      if (evicted.img && cache.get(evicted.img)?.tex === evicted.tex) {
+        cache.delete(evicted.img);
+      }
+    }
+  };
   const textureFor = (img) => {
     const isCanvas = img?.tagName === 'CANVAS';
     const key = isCanvas ? null : (img.currentSrc || img.src || null);
     const rev = img?.avatarTextureRevision ?? 0;
     const old = cache.get(img);
     if (old) {
-      if (!isCanvas && key && old.key === key) return old.tex;
-      if (isCanvas && old.rev === rev && rev > 0) return old.tex;
+      if (!isCanvas && key && old.key === key) {
+        touchLru({ img, tex: old.tex });
+        return old.tex;
+      }
+      if (isCanvas && old.rev === rev && rev > 0) {
+        touchLru({ img, tex: old.tex });
+        return old.tex;
+      }
     }
     const tex = old?.tex || gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -774,7 +803,7 @@ export function createRenderer(canvas, images = {}, { grid = 180 } = {}) {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      allTextures.push(tex);
+      allTextures.add(tex);
     }
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
     if (!isCanvas && key) {
@@ -788,6 +817,7 @@ export function createRenderer(canvas, images = {}, { grid = 180 } = {}) {
       textureSupport.set(tex, imageSupportPoints(img));
     }
     cache.set(img, { tex, key, rev });
+    touchLru({ img, tex });
     return tex;
   };
   const textures = {};
@@ -863,6 +893,8 @@ export function createRenderer(canvas, images = {}, { grid = 180 } = {}) {
     dispose() {
       disposed = true;
       for (const t of allTextures) gl.deleteTexture(t);
+      allTextures.clear();
+      texLru.length = 0;
       gl.deleteBuffer(positionBuffer);
       gl.deleteBuffer(uvBuffer);
       gl.deleteBuffer(indexBuffer);

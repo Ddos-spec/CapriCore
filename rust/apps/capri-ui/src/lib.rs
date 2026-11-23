@@ -259,6 +259,141 @@ async fn resolve_brain_endpoint() -> (String, String) {
     (preferred.trim_end_matches('/').to_string(), "blackarch-offline-retry".to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn find_newest_gemini_exe() -> Option<PathBuf> {
+    let local_app = std::env::var("LOCALAPPDATA").ok()?;
+    let root = PathBuf::from(local_app).join("Google").join("Gemini");
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.starts_with("app-"))
+                    .unwrap_or(false)
+            {
+                let exe = p.join("Gemini.exe");
+                if exe.exists() {
+                    let mt = std::fs::metadata(&exe)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    if best.as_ref().map(|(t, _)| mt > *t).unwrap_or(true) {
+                        best = Some((mt, exe));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, exe)) = best {
+        return Some(exe);
+    }
+    let fallback = root.join("Gemini.exe");
+    if fallback.exists() {
+        Some(fallback)
+    } else {
+        None
+    }
+}
+
+fn spawn_cookie_auto_healer(brain_url: String) {
+    #[cfg(target_os = "windows")]
+    tauri::async_runtime::spawn(async move {
+        use std::os::windows::process::CommandExt;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let Ok(cli) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        else {
+            return;
+        };
+        let health_url = format!("{}/health", brain_url.trim_end_matches('/'));
+        let Ok(resp) = cli.get(&health_url).send().await else {
+            return;
+        };
+        let Ok(hjson) = resp.json::<Value>().await else {
+            return;
+        };
+        if hjson.get("wiz_ok").and_then(|v| v.as_bool()) == Some(true) {
+            return;
+        }
+
+        let mut launched_temp = false;
+        let mut cookies_payload: Option<Value> = None;
+
+        if let Ok(r) = cli.get("http://127.0.0.1:19824/api/export-cookies").send().await {
+            if let Ok(v) = r.json::<Value>().await {
+                if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+                    cookies_payload = Some(v);
+                }
+            }
+        }
+
+        if cookies_payload.is_none() {
+            if let Some(exe) = find_newest_gemini_exe() {
+                let ps_cmd = format!(
+                    "Start-Process -FilePath '{}' -WindowStyle Minimized",
+                    exe.display().to_string().replace('\'', "''")
+                );
+                let spawned = std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
+                    .creation_flags(0x0800_0000)
+                    .spawn()
+                    .is_ok();
+                if spawned {
+                    launched_temp = true;
+                    for _ in 0..15 {
+                        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                        if let Ok(r) = cli
+                            .post("http://127.0.0.1:19824/eval")
+                            .body("Boolean(window.WIZ_global_data && window.WIZ_global_data.SNlM0e)")
+                            .send()
+                            .await
+                        {
+                            if let Ok(ev) = r.json::<Value>().await {
+                                if ev.get("result").and_then(|x| x.as_bool()) == Some(true) {
+                                    if let Ok(cr) = cli.get("http://127.0.0.1:19824/api/export-cookies").send().await {
+                                        if let Ok(cv) = cr.json::<Value>().await {
+                                            if cv.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+                                                cookies_payload = Some(cv);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ck) = cookies_payload {
+            let body = json!({
+                "psid": ck.get("psid").and_then(|v| v.as_str()).unwrap_or(""),
+                "psidts": ck.get("psidts").and_then(|v| v.as_str()).unwrap_or(""),
+                "cookieHeader": ck.get("cookieHeader").and_then(|v| v.as_str()).unwrap_or(""),
+            });
+            let post_url = format!("{}/api/cookies", brain_url.trim_end_matches('/'));
+            if let Ok(post_cli) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+            {
+                let _ = post_cli.post(&post_url).json(&body).send().await;
+            }
+        }
+
+        if launched_temp {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/IM", "Gemini.exe", "/F"])
+                .creation_flags(0x0800_0000)
+                .status();
+        }
+    });
+    #[cfg(not(target_os = "windows"))]
+    let _ = brain_url;
+}
+
 async fn run_static_asset_server(std_listener: std::net::TcpListener, assets_dir: PathBuf) {
     let Ok(listener) = TcpListener::from_std(std_listener) else {
         return;
@@ -353,7 +488,7 @@ pub fn run() {
     let state = UiState {
         asset_base_url,
         assets_dir: assets_dir.clone(),
-        brain_url,
+        brain_url: brain_url.clone(),
         brain_mode,
         hit_rects: Arc::clone(&hit_rects),
         click_through_locked: Arc::clone(&click_through_locked),
@@ -363,6 +498,7 @@ pub fn run() {
     let listener_slot = Arc::new(Mutex::new(Some(std_listener)));
     let listener_for_setup = Arc::clone(&listener_slot);
     let assets_for_setup = assets_dir;
+    let brain_url_for_healer = brain_url;
 
     tauri::Builder::default()
         .manage(state)
@@ -392,6 +528,7 @@ pub fn run() {
                     });
                 }
             }
+            spawn_cookie_auto_healer(brain_url_for_healer);
             let main_win = app.get_webview_window("main").unwrap();
             let (screen_w, screen_h) = win_auto::get_primary_screen_rect();
             let stage_w = (screen_w as u32).max(800);

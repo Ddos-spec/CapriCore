@@ -114,21 +114,21 @@ impl GeminiClient {
         }
     }
 
-    /// Spawn background 9-minute cookie rotation timer so `__Secure-1PSIDTS` stays fresh.
+    /// Spawn background 7.5-minute cookie rotation timer so `__Secure-1PSIDTS` and `*PSIDCC` stay fresh 24/7.
     pub fn spawn_rotation_task(self: &Arc<Self>) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(540));
-            interval.tick().await; // skip immediate first tick
+            tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(450));
             loop {
                 interval.tick().await;
                 let has_cookies = {
                     let g = me.state.read().await;
-                    !g.bundle.psid.is_empty()
+                    !g.bundle.psid.is_empty() || !g.bundle.cookie_header.is_empty()
                 };
                 if has_cookies {
                     match me.rotate_cookies().await {
-                        Ok(true) => info!("Gemini background RotateCookies refreshed PSIDTS"),
+                        Ok(true) => info!("Gemini background RotateCookies refreshed & persisted cookies"),
                         Ok(false) => {}
                         Err(e) => warn!("Gemini background RotateCookies error: {}", e),
                     }
@@ -208,6 +208,55 @@ impl GeminiClient {
         })
     }
 
+    async fn merge_set_cookies(&self, headers: &reqwest::header::HeaderMap) -> Result<bool> {
+        let mut updates: Vec<(String, String)> = Vec::new();
+        for val in headers.get_all(reqwest::header::SET_COOKIE) {
+            if let Ok(s) = val.to_str() {
+                if let Some((kv, _)) = s.split_once(';') {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        let key = k.trim();
+                        let value = v.trim();
+                        if !key.is_empty()
+                            && !value.is_empty()
+                            && !value.eq_ignore_ascii_case("deleted")
+                        {
+                            updates.push((key.to_string(), value.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        if updates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut g = self.state.write().await;
+        let old_hdr = g.bundle.cookie_header.clone();
+        let mut map = parse_cookie_map(&old_hdr);
+        if map.is_empty() && !g.bundle.psid.is_empty() {
+            map.insert("__Secure-1PSID".to_string(), g.bundle.psid.clone());
+            if !g.bundle.psidts.is_empty() {
+                map.insert("__Secure-1PSIDTS".to_string(), g.bundle.psidts.clone());
+            }
+        }
+        for (k, v) in updates {
+            if k == "__Secure-1PSID" {
+                g.bundle.psid = v.clone();
+            } else if k == "__Secure-1PSIDTS" {
+                g.bundle.psidts = v.clone();
+            }
+            map.insert(k, v);
+        }
+        let new_hdr = format_cookie_map(&map);
+        if new_hdr == old_hdr {
+            return Ok(false);
+        }
+        g.bundle.cookie_header = new_hdr;
+        g.bundle.updated_at = now_epoch_secs();
+        save_bundle_to_disk(&self.cookies_path, &g.bundle)?;
+        Ok(true)
+    }
+
     pub async fn rotate_cookies(&self) -> Result<bool> {
         let cookie_str = self.effective_cookie_header().await?;
         let resp = self
@@ -221,32 +270,7 @@ impl GeminiClient {
             .await
             .context("RotateCookies request failed")?;
 
-        let mut new_psidts: Option<String> = None;
-        for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
-            if let Ok(s) = val.to_str() {
-                if let Some((kv, _)) = s.split_once(';') {
-                    if let Some((k, v)) = kv.split_once('=') {
-                        if k.trim() == "__Secure-1PSIDTS" && !v.trim().is_empty() {
-                            new_psidts = Some(v.trim().to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(ts) = new_psidts {
-            let mut g = self.state.write().await;
-            g.bundle.psidts = ts.clone();
-            let mut map = parse_cookie_map(&g.bundle.cookie_header);
-            map.insert("__Secure-1PSID".to_string(), g.bundle.psid.clone());
-            map.insert("__Secure-1PSIDTS".to_string(), ts);
-            g.bundle.cookie_header = format_cookie_map(&map);
-            g.bundle.updated_at = now_epoch_secs();
-            save_bundle_to_disk(&self.cookies_path, &g.bundle)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.merge_set_cookies(resp.headers()).await
     }
 
     pub async fn fetch_wiz_tokens(&self) -> Result<WizTokens> {
@@ -272,7 +296,9 @@ impl GeminiClient {
             .context("GET gemini.google.com/app failed")?;
 
         let status = resp.status();
+        let headers = resp.headers().clone();
         let html = resp.text().await?;
+        let _ = self.merge_set_cookies(&headers).await;
         if !status.is_success() {
             return Err(anyhow!("gemini.google.com/app returned status {}", status));
         }
@@ -324,7 +350,9 @@ impl GeminiClient {
             .context("content-push upload request failed")?;
 
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = resp.text().await?;
+        let _ = self.merge_set_cookies(&headers).await;
         if !status.is_success() {
             return Err(anyhow!("content-push returned {}: {}", status, body));
         }
@@ -452,7 +480,9 @@ impl GeminiClient {
             .context("StreamGenerate HTTP call failed")?;
 
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = resp.text().await?;
+        let _ = self.merge_set_cookies(&headers).await;
         if !status.is_success() {
             return Err(anyhow!("StreamGenerate status {}: {}", status, body.chars().take(300).collect::<String>()));
         }

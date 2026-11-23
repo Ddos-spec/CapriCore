@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Avant-garde demoscene + Studio TRIGGER Edgerunners compositor for Capri-RS.
-// Zero idle overhead: requestAnimationFrame spins up only while effects are active and clears 100% transparent afterwards.
+// Zero idle overhead & zero idle VRAM: frees full-monitor backing store immediately after animations finish.
 import {
   draw as drawTeleport,
   prepareTeleportMotion,
@@ -23,6 +23,14 @@ function easeOutExpo(t) {
   return t >= 1 ? 1 : 1 - Math.pow(2, -10 * clamp(t));
 }
 
+function seededRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
 function actorBoxToAnchorPoint(box) {
   const size = box.size ?? 320;
   return {
@@ -38,6 +46,119 @@ function actorBoxCenter(box) {
   return { x: box.x + size * 0.5, y: box.y + size * 0.48 };
 }
 
+function drawLichtenbergPath(ctx, pts, width, color) {
+  if (pts.length < 2) return;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.lineWidth = width;
+  ctx.lineCap = 'square';
+  ctx.lineJoin = 'bevel';
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
+function subdivideBolt(x1, y1, x2, y2, depth, jitter, rand) {
+  let pts = [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+  let disp = jitter;
+  for (let d = 0; d < depth; d++) {
+    const next = [pts[0]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i];
+      const b = pts[i + 1];
+      const mx = (a.x + b.x) * 0.5;
+      const my = (a.y + b.y) * 0.5;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const nx = -dy / len;
+      const ny = dx / len;
+      const offset = (rand() - 0.5) * 2 * disp;
+      next.push({ x: mx + nx * offset, y: my + ny * offset });
+      next.push(b);
+    }
+    pts = next;
+    disp *= 0.56;
+  }
+  return pts;
+}
+
+/** Recursive midpoint-displacement fractal lightning rift in 3 chromatic passes (#00f0ff / #ff003d / #ffffff). */
+export function drawLichtenbergRift(ctx, x1, y1, x2, y2, seed, jitter = 52) {
+  const rand = seededRng(seed);
+  const main = subdivideBolt(x1, y1, x2, y2, 4, jitter, rand);
+  const forks = [];
+  for (let f = 0; f < 4; f++) {
+    const idx = Math.max(1, Math.min(main.length - 2, Math.floor((0.18 + f * 0.21) * main.length)));
+    const p = main[idx];
+    const ang = Math.atan2(y2 - y1, x2 - x1) + (f % 2 === 0 ? 1 : -1) * (0.45 + rand() * 0.65);
+    const reach = 75 + rand() * 140;
+    forks.push(subdivideBolt(p.x, p.y, p.x + Math.cos(ang) * reach, p.y + Math.sin(ang) * reach, 3, jitter * 0.4, rand));
+  }
+
+  ctx.save();
+  ctx.translate(-4, 0);
+  drawLichtenbergPath(ctx, main, 4.5, 'rgba(0, 240, 255, 0.82)');
+  for (const fk of forks) drawLichtenbergPath(ctx, fk, 2.0, 'rgba(0, 240, 255, 0.65)');
+
+  ctx.translate(8, 0);
+  drawLichtenbergPath(ctx, main, 5.2, 'rgba(255, 0, 61, 0.92)');
+  for (const fk of forks) drawLichtenbergPath(ctx, fk, 2.4, 'rgba(255, 0, 61, 0.78)');
+
+  ctx.translate(-4, 0);
+  drawLichtenbergPath(ctx, main, 2.1, 'rgba(255, 250, 252, 0.96)');
+  for (const fk of forks) drawLichtenbergPath(ctx, fk, 1.1, 'rgba(255, 255, 255, 0.85)');
+  ctx.restore();
+}
+
+/** Asymmetric Studio TRIGGER graphic anime impact star burst (10 tapered needles + 45deg slash, zero halo). */
+export function drawTriggerImpactStar(ctx, cx, cy, radius, age, seed = 77) {
+  if (age >= 1) return;
+  const rand = seededRng(seed);
+  const scale = age < 0.25 ? 0.55 + age * 2.2 : 1.1 - (age - 0.25) * 0.5;
+  const alpha = age < 0.35 ? 1 : Math.max(0, 1 - (age - 0.35) / 0.65);
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.globalAlpha = alpha;
+
+  // Stark 45deg graphic slash needle
+  const slashLen = radius * 1.45 * scale;
+  ctx.save();
+  ctx.rotate(-0.78);
+  ctx.beginPath();
+  ctx.moveTo(-slashLen, 0);
+  ctx.lineTo(0, -radius * 0.08 * (1 - age));
+  ctx.lineTo(slashLen, 0);
+  ctx.lineTo(0, radius * 0.08 * (1 - age));
+  ctx.closePath();
+  ctx.fillStyle = age < 0.22 ? '#ffffff' : '#ff003d';
+  ctx.fill();
+  ctx.restore();
+
+  // 10 sharp tapered asymmetric needles
+  for (let i = 0; i < 10; i++) {
+    const ang = (i / 10) * Math.PI * 2 + (rand() - 0.5) * 0.28;
+    const outer = radius * (0.48 + (i % 3 === 0 ? 0.68 : rand() * 0.42)) * scale;
+    const inner = radius * (0.09 + rand() * 0.08);
+    const halfBase = radius * (0.032 + rand() * 0.028) * (1 - age * 0.7);
+    const cos = Math.cos(ang);
+    const sin = Math.sin(ang);
+    const nx = -sin;
+    const ny = cos;
+
+    ctx.beginPath();
+    ctx.moveTo(cos * outer, sin * outer);
+    ctx.lineTo(cos * inner + nx * halfBase, sin * inner + ny * halfBase);
+    ctx.lineTo(cos * inner * 0.4, sin * inner * 0.4);
+    ctx.lineTo(cos * inner - nx * halfBase, sin * inner - ny * halfBase);
+    ctx.closePath();
+    ctx.fillStyle = i % 3 === 0 ? '#ffffff' : i % 3 === 1 ? '#ff003d' : '#120309';
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 export class RedBreachCompositor {
   constructor(canvas) {
     this.canvas = canvas;
@@ -47,8 +168,13 @@ export class RedBreachCompositor {
     this.particles = [];
     this.raf = 0;
     this.boundTick = this.tick.bind(this);
-    this.resize();
-    window.addEventListener('resize', () => this.resize());
+    this.width = Math.max(1, Math.floor(window.innerWidth));
+    this.height = Math.max(1, Math.floor(window.innerHeight));
+    this.canvas.width = 1;
+    this.canvas.height = 1;
+    window.addEventListener('resize', () => {
+      if (this.raf) this.resize();
+    });
   }
 
   resize() {
@@ -57,19 +183,55 @@ export class RedBreachCompositor {
     const h = Math.max(1, Math.floor(window.innerHeight));
     this.width = w;
     this.height = h;
-    if (this.canvas.width !== Math.floor(w * this.dpr)) {
-      this.canvas.width = Math.floor(w * this.dpr);
-    }
-    if (this.canvas.height !== Math.floor(h * this.dpr)) {
-      this.canvas.height = Math.floor(h * this.dpr);
-    }
+    const targetW = Math.floor(w * this.dpr);
+    const targetH = Math.floor(h * this.dpr);
+    if (this.canvas.width !== targetW) this.canvas.width = targetW;
+    if (this.canvas.height !== targetH) this.canvas.height = targetH;
   }
 
   ensureRunning() {
+    this.resize();
     if (!this.raf) {
-      this.resize();
       this.raf = requestAnimationFrame(this.boundTick);
     }
+  }
+
+  triggerImpactStar(x, y, radius = 150) {
+    this.particles.push({
+      kind: 'impact_star',
+      x,
+      y,
+      radius,
+      seed: (Date.now() ^ Math.floor(Math.random() * 9999)) >>> 0,
+      start: performance.now(),
+      duration: 145,
+    });
+    this.ensureRunning();
+  }
+
+  spawnGlassShards(cx, cy, count = 12, radius = 280) {
+    const start = performance.now();
+    for (let i = 0; i < count; i++) {
+      const ang = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.45;
+      const spd = (0.35 + Math.random() * 0.85) * radius;
+      const w = 10 + Math.random() * 20;
+      const h = 6 + Math.random() * 14;
+      this.particles.push({
+        kind: 'glass',
+        x: cx + (Math.random() - 0.5) * 90,
+        y: cy + (Math.random() - 0.5) * 50,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        rot: Math.random() * Math.PI,
+        vrot: (Math.random() - 0.5) * 4.5,
+        w,
+        h,
+        color: i % 3 === 0 ? 'rgba(255, 255, 255, 0.72)' : i % 2 === 0 ? 'rgba(255, 0, 61, 0.64)' : 'rgba(0, 240, 255, 0.52)',
+        start,
+        duration: 280 + Math.random() * 180,
+      });
+    }
+    this.ensureRunning();
   }
 
   spawnImpactBurst(x, y, { color = '#ff003d', count = 14, radius = 96 } = {}) {
@@ -81,7 +243,7 @@ export class RedBreachCompositor {
       color,
       radius,
       start,
-      duration: 380,
+      duration: 360,
     });
     for (let i = 0; i < count; i++) {
       const ang = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
@@ -111,7 +273,7 @@ export class RedBreachCompositor {
       y,
       angle: angleRad,
       color,
-      len: 150 + Math.random() * 70,
+      len: 160 + Math.random() * 75,
       start: performance.now(),
       duration: 165,
     });
@@ -133,7 +295,13 @@ export class RedBreachCompositor {
         from: fromPt,
         to: toPt,
         scale: toPt.scale,
-        effects: { sandevistanCopies: 14, sandevistanHoldMs: 420, sandevistanHue: 345, sandevistanHueStep: 14, sandevistanTint: 62 },
+        effects: {
+          sandevistanCopies: 14,
+          sandevistanHoldMs: 420,
+          sandevistanHue: 345,
+          sandevistanHueStep: 14,
+          sandevistanTint: 62,
+        },
       });
       sandiStamps = sandevistanStamps(spriteImg, sandi);
     } else {
@@ -146,6 +314,8 @@ export class RedBreachCompositor {
       });
     }
 
+    this.spawnGlassShards(targetCenter.x, targetCenter.y, 12, 310);
+
     let arrived = false;
     const job = {
       start,
@@ -155,80 +325,69 @@ export class RedBreachCompositor {
         const w = this.width;
         const h = this.height;
 
-        // 0-120ms: Studio TRIGGER Breach Flash + diagonal screen fracture + kinetic stamp
-        if (elapsed < 210) {
-          // Exposure on twos (approx 41.6ms steps)
+        // 0-260ms: Studio TRIGGER Breach Flash + fractal Lichtenberg rift + chromatic bars + kinetic stamp
+        if (elapsed < 260) {
           const stepIdx = Math.floor(elapsed / 42);
-          const flashAlpha = stepIdx === 0 ? 0.36 : stepIdx === 1 ? 0.22 : stepIdx === 2 ? 0.14 : 0.05;
+          const flashAlpha = stepIdx === 0 ? 0.42 : stepIdx === 1 ? 0.28 : stepIdx === 2 ? 0.16 : 0.06;
           ctx.save();
-          // Radial crimson vignette edge flash
           const grad = ctx.createRadialGradient(
             targetCenter.x,
             targetCenter.y,
-            h * 0.14,
+            h * 0.12,
             targetCenter.x,
             targetCenter.y,
-            Math.max(w, h) * 0.82,
+            Math.max(w, h) * 0.85,
           );
-          grad.addColorStop(0, `rgba(255, 0, 51, ${(flashAlpha * 0.42).toFixed(3)})`);
-          grad.addColorStop(0.6, `rgba(210, 0, 42, ${(flashAlpha * 0.72).toFixed(3)})`);
-          grad.addColorStop(1, `rgba(120, 0, 26, ${(flashAlpha * 1.1).toFixed(3)})`);
+          grad.addColorStop(0, `rgba(255, 0, 51, ${(flashAlpha * 0.48).toFixed(3)})`);
+          grad.addColorStop(0.55, `rgba(220, 0, 44, ${(flashAlpha * 0.78).toFixed(3)})`);
+          grad.addColorStop(1, `rgba(110, 0, 24, ${(flashAlpha * 1.12).toFixed(3)})`);
           ctx.fillStyle = grad;
           ctx.fillRect(0, 0, w, h);
 
-          // Razor diagonal screen fracture through summon target
-          const riftP = easeOutExpo(elapsed / 120);
-          const x1 = targetCenter.x - w * 0.65 * riftP;
-          const y1 = targetCenter.y + h * 0.28 * riftP;
-          const x2 = targetCenter.x + w * 0.65 * riftP;
-          const y2 = targetCenter.y - h * 0.28 * riftP;
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(targetCenter.x - 24, targetCenter.y + 18);
-          ctx.lineTo(x2, y2);
-          ctx.lineTo(targetCenter.x + 28, targetCenter.y - 4);
-          ctx.closePath();
-          ctx.fillStyle = stepIdx % 2 === 0 ? 'rgba(255, 245, 248, 0.92)' : 'rgba(255, 0, 61, 0.88)';
-          ctx.fill();
+          // Full-screen recursive fractal Lichtenberg rift across target
+          const riftP = easeOutExpo(elapsed / 95);
+          const rx1 = targetCenter.x - w * 0.62 * riftP;
+          const ry1 = targetCenter.y + h * 0.3 * riftP;
+          const rx2 = targetCenter.x + w * 0.62 * riftP;
+          const ry2 = targetCenter.y - h * 0.3 * riftP;
+          drawLichtenbergRift(ctx, rx1, ry1, rx2, ry2, seed + stepIdx * 19, 54);
 
-          // Horizontal chromatic scanline cuts
-          for (let b = 0; b < 5; b++) {
+          // Horizontal chromatic scanline tears
+          for (let b = 0; b < 6; b++) {
             const by = ((seed * (b + 3)) % Math.max(200, h - 80)) + 20;
-            const bh = 2 + ((seed >> b) % 5);
+            const bh = 2 + ((seed >> b) % 6);
             const bw = w * (0.28 + ((b * 17) % 50) / 100);
-            const bx = ((b % 2 === 0 ? 1 : -1) * elapsed * 1.4 + w * 0.3) % w;
-            ctx.fillStyle = b % 2 === 0 ? 'rgba(255, 0, 61, 0.72)' : 'rgba(0, 240, 255, 0.55)';
+            const bx = ((b % 2 === 0 ? 1 : -1) * elapsed * 1.5 + w * 0.28) % w;
+            ctx.fillStyle = b % 2 === 0 ? 'rgba(255, 0, 61, 0.76)' : 'rgba(0, 240, 255, 0.58)';
             ctx.fillRect(bx, by, bw, bh);
           }
 
-          // Fleeting kinetic stamp "BREACH // CAPRI" along fracture (shatters cleanly before 200ms)
-          if (elapsed < 185) {
-            ctx.translate(targetCenter.x, targetCenter.y - 110);
+          if (elapsed < 225) {
+            ctx.translate(targetCenter.x, targetCenter.y - 118);
             ctx.rotate(-0.22);
-            ctx.font = '900 18px "Consolas", "Courier New", monospace';
+            ctx.font = '900 20px "Consolas", "Courier New", monospace';
             ctx.textAlign = 'center';
-            const fade = clamp(1 - elapsed / 185);
-            ctx.fillStyle = `rgba(0, 240, 255, ${(fade * 0.85).toFixed(2)})`;
-            ctx.fillText('BREACH // CAPRI', -3, -2);
-            ctx.fillStyle = `rgba(255, 0, 61, ${(fade * 0.95).toFixed(2)})`;
-            ctx.fillText('BREACH // CAPRI', 3, 2);
+            const fade = clamp(1 - elapsed / 225);
+            ctx.fillStyle = `rgba(0, 240, 255, ${(fade * 0.88).toFixed(2)})`;
+            ctx.fillText('BREACH // CAPRI', -4, -2);
+            ctx.fillStyle = `rgba(255, 0, 61, ${(fade * 0.96).toFixed(2)})`;
+            ctx.fillText('BREACH // CAPRI', 4, 2);
             ctx.fillStyle = `rgba(255, 255, 255, ${fade.toFixed(2)})`;
             ctx.fillText('BREACH // CAPRI', 0, 0);
           }
           ctx.restore();
         }
 
-        // Anisotropic speed-lines converging onto target
         if (elapsed >= 60 && elapsed <= 460) {
           const p = (elapsed - 60) / 400;
-          const alpha = Math.sin(p * Math.PI) * 0.58;
+          const alpha = Math.sin(p * Math.PI) * 0.62;
           ctx.save();
           ctx.strokeStyle = `rgba(255, 0, 61, ${alpha.toFixed(2)})`;
-          ctx.lineWidth = 2;
-          for (let i = 0; i < 16; i++) {
+          ctx.lineWidth = 2.2;
+          for (let i = 0; i < 18; i++) {
             const ang = ((seed + i * 97) % 360) * (Math.PI / 180);
             const inner = 70 + (1 - p) * 260;
-            const outer = inner + 140 + (i % 3) * 80;
+            const outer = inner + 150 + (i % 3) * 85;
             ctx.beginPath();
             ctx.moveTo(targetCenter.x + Math.cos(ang) * inner, targetCenter.y + Math.sin(ang) * inner);
             ctx.lineTo(targetCenter.x + Math.cos(ang) * outer, targetCenter.y + Math.sin(ang) * outer);
@@ -237,13 +396,12 @@ export class RedBreachCompositor {
           ctx.restore();
         }
 
-        // 75-620ms: Official Red Lightning or Sandevistan flight
         if (elapsed >= 75) {
           const flightElapsed = elapsed - 75;
           if (style === 'sandevistan' && sandi && sandiStamps) {
             drawSandevistan(ctx, sandi, flightElapsed * 1.15, sandiStamps, arrivalImg || spriteImg);
           } else if (motion) {
-            const frame = Math.min(teleportTotalFrames - 1, (flightElapsed / 560) * (teleportTotalFrames - 1));
+            const frame = Math.min(teleportTotalFrames - 1, (flightElapsed / 540) * (teleportTotalFrames - 1));
             const drawCapri = (pt, tint = 0) => {
               const img = arrivalImg || spriteImg;
               if (!img) return;
@@ -275,10 +433,11 @@ export class RedBreachCompositor {
 
         if (!arrived && elapsed >= 520) {
           arrived = true;
-          this.spawnImpactBurst(targetCenter.x, targetCenter.y + 30, {
+          this.triggerImpactStar(targetCenter.x, targetCenter.y, (to.size ?? 320) * 0.56);
+          this.spawnImpactBurst(targetCenter.x, targetCenter.y + 26, {
             color: '#ff003d',
             count: 18,
-            radius: 145,
+            radius: 150,
           });
           onArrive?.();
         }
@@ -303,7 +462,13 @@ export class RedBreachCompositor {
         from: fromPt,
         to: toPt,
         scale: toPt.scale,
-        effects: { sandevistanCopies: 12, sandevistanHoldMs: 420, sandevistanHue: 170, sandevistanHueStep: 12, sandevistanTint: 58 },
+        effects: {
+          sandevistanCopies: 12,
+          sandevistanHoldMs: 420,
+          sandevistanHue: 170,
+          sandevistanHueStep: 12,
+          sandevistanTint: 58,
+        },
       });
       sandiStamps = sandevistanStamps(spriteImg, sandi);
     } else {
@@ -356,7 +521,8 @@ export class RedBreachCompositor {
         }
         if (!arrived && elapsed >= duration * 0.78) {
           arrived = true;
-          this.spawnImpactBurst(targetCenter.x, targetCenter.y + 40, {
+          this.triggerImpactStar(targetCenter.x, targetCenter.y + 10, (to.size ?? 320) * 0.42);
+          this.spawnImpactBurst(targetCenter.x, targetCenter.y + 38, {
             color: style === 'sandevistan' ? '#00f0ff' : '#ff003d',
             count: 10,
             radius: 85,
@@ -371,7 +537,7 @@ export class RedBreachCompositor {
 
   playStartupIntroFx({ rect, introImages, onDone } = {}) {
     const start = performance.now();
-    const duration = 2600;
+    const duration = 2400;
     let doneCalled = false;
     const finish = () => {
       if (!doneCalled) {
@@ -384,9 +550,8 @@ export class RedBreachCompositor {
       duration,
       render: (ctx, now) => {
         const elapsed = now - start;
-        // Brief TRIGGER screen crimson blink at t < 240ms
         if (elapsed < 240) {
-          const a = (1 - elapsed / 240) * 0.24;
+          const a = (1 - elapsed / 240) * 0.28;
           const grad = ctx.createRadialGradient(
             rect.x + rect.width * 0.5,
             rect.y + rect.height * 0.5,
@@ -401,7 +566,6 @@ export class RedBreachCompositor {
           ctx.fillRect(0, 0, this.width, this.height);
         }
 
-        // Official 24fps startup intro into dedicated scratch region
         drawStartupIntro(ctx, {
           time: elapsed,
           width: this.width,
@@ -444,13 +608,40 @@ export class RedBreachCompositor {
       if (age >= 1) continue;
       nextParticles.push(p);
       ctx.save();
-      if (p.kind === 'ring') {
-        const r = 14 + easeOutExpo(age) * p.radius;
-        ctx.globalAlpha = (1 - age) * 0.85;
-        ctx.strokeStyle = p.color;
-        ctx.lineWidth = Math.max(1, (1 - age) * 4.5);
+      if (p.kind === 'impact_star') {
+        drawTriggerImpactStar(ctx, p.x, p.y, p.radius, age, p.seed);
+      } else if (p.kind === 'glass') {
+        const dist = easeOutExpo(age);
+        const px = p.x + p.vx * dist;
+        const py = p.y + p.vy * dist;
+        ctx.globalAlpha = 1 - age * age;
+        ctx.translate(px, py);
+        ctx.rotate(p.rot + p.vrot * age);
+        ctx.fillStyle = p.color;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+        ctx.moveTo(-p.w * 0.5, -p.h * 0.4);
+        ctx.lineTo(p.w * 0.6, -p.h * 0.15);
+        ctx.lineTo(p.w * 0.35, p.h * 0.55);
+        ctx.lineTo(-p.w * 0.45, p.h * 0.25);
+        ctx.closePath();
+        ctx.fill();
+      } else if (p.kind === 'ring') {
+        const r = 18 + easeOutExpo(age) * p.radius;
+        ctx.globalAlpha = (1 - age) * 0.9;
+        ctx.strokeStyle = p.color;
+        ctx.lineWidth = Math.max(1.2, (1 - age) * 4.5);
+        ctx.translate(p.x, p.y);
+        ctx.rotate(-0.18 + age * 0.24);
+        ctx.beginPath();
+        for (let k = 0; k < 8; k++) {
+          const ang = (k / 8) * Math.PI * 2;
+          const rk = r * (k % 2 === 0 ? 1.12 : 0.78);
+          const px = Math.cos(ang) * rk;
+          const py = Math.sin(ang) * rk;
+          if (k === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
         ctx.stroke();
       } else if (p.kind === 'shard') {
         const dist = easeOutExpo(age);
@@ -491,8 +682,9 @@ export class RedBreachCompositor {
     if (this.activeJobs.length > 0 || this.particles.length > 0) {
       this.raf = requestAnimationFrame(this.boundTick);
     } else {
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      // Zero-VRAM idle release: shrink full-monitor backing canvas until next animation triggers
+      this.canvas.width = 1;
+      this.canvas.height = 1;
     }
   }
 }

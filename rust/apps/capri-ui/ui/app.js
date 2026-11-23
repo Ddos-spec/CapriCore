@@ -3,7 +3,6 @@ import {
   CHANNELS,
   createRenderer,
   resolvePose,
-  sampleCustomGesture,
 } from './engines/idle-gesture-rig.mjs';
 import { AvatarDragTether } from './engines/avatar-drag-tether.mjs';
 import {
@@ -36,8 +35,17 @@ import { RedBreachCompositor } from './engines/red-breach-fx.mjs';
 const invoke = (cmd, args = {}) => window.__TAURI__.core.invoke(cmd, args);
 const listen = (ev, cb) => window.__TAURI__.event.listen(ev, cb);
 
-const ACTOR_SIZE = 320;
+let actorSize = 320;
 const CANVAS_EXTENT = 1254;
+const MAX_CACHED_SPRITES = 10;
+const PINNED_SPRITES = new Set([
+  'neutral',
+  'smirk',
+  'attentive',
+  'thinking',
+  'surprised',
+  'pose-sit-edge',
+]);
 
 const elFxCanvas = document.getElementById('fx-canvas');
 const elActor = document.getElementById('capri-actor');
@@ -51,7 +59,7 @@ const breachFx = new RedBreachCompositor(elFxCanvas);
 const dragTether = new AvatarDragTether();
 const visemes = new AvatarVisemes();
 const mouthLayer = new AvatarMouthLayer(elSourceImg);
-const headpat = new AvatarHeadpat(elActor);
+let headpat = null;
 const wave = new AvatarWave(elActor, { canPlay: () => !muted && !hiddenStandby });
 const musicAnim = new MusicAnimation();
 const musicPose = new MusicPoseLayer();
@@ -70,12 +78,14 @@ let config = {
 
 const spriteUrls = new Map();
 const spriteImgs = new Map();
+const spriteLru = [];
+const pendingLoads = new Map();
 let introImages = [];
 
 // Stage position & spring physics
 const stage = {
-  x: Math.max(0, (window.innerWidth || 1920) - ACTOR_SIZE - 24),
-  y: Math.max(0, (window.innerHeight || 1080) - ACTOR_SIZE - 48),
+  x: Math.max(0, (window.innerWidth || 1920) - actorSize - 24),
+  y: Math.max(0, (window.innerHeight || 1080) - actorSize - 48),
   squishX: 1,
   squishY: 1,
   squishVx: 0,
@@ -93,21 +103,33 @@ let autoRoam = true;
 let speaking = false;
 let thinking = false;
 let audioLevel = 0;
+let prevAudioLevel = 0;
+let speechNod = 0;
 let inFlightRequest = false;
 let introPlaying = true;
 let dragActive = false;
 let teleporting = false;
+let breachInFlight = false;
+let stuntCycleIndex = 0;
 
-let activeClip = null; // { id, frameId, side, startedAt, durationMs, onEnd }
+let activeClip = null;
 let glitchUntil = 0;
 let impactUntil = 0;
 let musicActive = false;
 let musicStartedAt = 0;
 let musicFrameId = 'music-floor';
 
-// Live cursor & whip physics
-let cursorPos = { x: stage.x, y: stage.y, lastX: stage.x, lastY: stage.y, lastAt: performance.now() };
+// Live cursor, whip & curiosity tease physics
+let cursorPos = {
+  x: stage.x,
+  y: stage.y,
+  lastX: stage.x,
+  lastY: stage.y,
+  lastAt: performance.now(),
+  stillSince: performance.now(),
+};
 let lastWhipAt = 0;
+let lastTeaseAt = 0;
 let lastBlinkAt = performance.now();
 let nextBlinkDelay = 3600;
 let blinkPhaseUntil = 0;
@@ -236,6 +258,9 @@ const DESKTOP_CONTROL_TOOL = {
 const DESKTOP_INTENT_RE =
   /\b(layar|screen|liat|lihat|buka|tutup|klik|ketik|file|folder|cek|jalanin|run|terminal|cmd|powershell|cari|google|youtube|spotify|code|vscode|screenshot|bantu|error|bug|install|window|aplikasi)\b/i;
 
+const SELF_ACTION_INTENT_RE =
+  /\b(diam|mute|unmute|bisu|tutup|keluar|matiin|udahan|sembunyi|hilang|tidur|bangun|pindah|nemplok|duduk|gelantungan|atap|atas|kiri|kanan|pojok|bawah|keytar|gitar|joget|dance|sandevistan|teleport|keluyuran|roam|suara|efek|fx|radio|hologram|cyber|ekspresi|senyum|marah)\b/i;
+
 function preloadImage(url) {
   return new Promise((resolve) => {
     const img = new Image();
@@ -247,8 +272,48 @@ function preloadImage(url) {
   });
 }
 
+function touchSpriteLru(id) {
+  const idx = spriteLru.indexOf(id);
+  if (idx >= 0) spriteLru.splice(idx, 1);
+  spriteLru.push(id);
+  while (spriteImgs.size > MAX_CACHED_SPRITES) {
+    const evictIdx = spriteLru.findIndex((cand) => !PINNED_SPRITES.has(cand) && cand !== currentBaseMood && cand !== overrideMood);
+    if (evictIdx < 0) break;
+    const evictedId = spriteLru.splice(evictIdx, 1)[0];
+    spriteImgs.delete(evictedId);
+  }
+}
+
+function ensureSpriteLoaded(id) {
+  const targetId = spriteUrls.has(id) ? id : 'neutral';
+  if (spriteImgs.has(targetId)) {
+    touchSpriteLru(targetId);
+    return Promise.resolve(spriteImgs.get(targetId));
+  }
+  if (pendingLoads.has(targetId)) {
+    return pendingLoads.get(targetId);
+  }
+  const url = spriteUrls.get(targetId);
+  if (!url) return Promise.resolve(null);
+  const p = preloadImage(url).then((img) => {
+    pendingLoads.delete(targetId);
+    if (img) {
+      spriteImgs.set(targetId, img);
+      touchSpriteLru(targetId);
+    }
+    return img;
+  });
+  pendingLoads.set(targetId, p);
+  return p;
+}
+
 function getSpriteImg(id) {
-  return spriteImgs.get(id) || spriteImgs.get('neutral') || null;
+  if (spriteImgs.has(id)) {
+    touchSpriteLru(id);
+    return spriteImgs.get(id);
+  }
+  void ensureSpriteLoaded(id);
+  return spriteImgs.get('neutral') || null;
 }
 
 function activeSpriteId() {
@@ -268,7 +333,9 @@ function syncSourceImg(id) {
 }
 
 function setMood(mood) {
-  currentBaseMood = spriteUrls.has(mood) ? mood : 'neutral';
+  const target = spriteUrls.has(mood) ? mood : 'neutral';
+  currentBaseMood = target;
+  void ensureSpriteLoaded(target);
 }
 
 function triggerImpact(ms = 110, glitchMs = 260) {
@@ -280,6 +347,16 @@ function triggerImpact(ms = 110, glitchMs = 260) {
 function triggerSquish(sx = 1.07, sy = 0.92) {
   stage.squishX = sx;
   stage.squishY = sy;
+}
+
+function setActorScaleSize(newSize) {
+  actorSize = Math.round(Math.max(220, Math.min(420, newSize)));
+  elActor.style.width = `${actorSize}px`;
+  elActor.style.height = `${actorSize}px`;
+  const c = clampActorPos(stage.x, stage.y);
+  stage.x = c.x;
+  stage.y = c.y;
+  triggerSquish(1.06, 0.94);
 }
 
 function updateActorDomPosition() {
@@ -299,8 +376,8 @@ function updateActorDomPosition() {
 }
 
 function clampActorPos(x, y) {
-  const maxX = Math.max(0, (config.screenWidth || window.innerWidth) - ACTOR_SIZE + 52);
-  const maxY = Math.max(0, (config.screenHeight || window.innerHeight) - ACTOR_SIZE + 12);
+  const maxX = Math.max(0, (config.screenWidth || window.innerWidth) - actorSize + 52);
+  const maxY = Math.max(0, (config.screenHeight || window.innerHeight) - actorSize + 12);
   return {
     x: Math.max(-52, Math.min(maxX, x)),
     y: Math.max(-28, Math.min(maxY, y)),
@@ -308,11 +385,15 @@ function clampActorPos(x, y) {
 }
 
 function startClip(id, { frameId, side = 'left', onEnd } = {}) {
-  if (registeredCelClip(id)) {
-    const cel = registeredCelClip(id);
+  wave.stop();
+  const cel = registeredCelClip(id);
+  const targetFrame = frameId || cel?.frameId || 'pose-sit-edge';
+  void ensureSpriteLoaded(targetFrame);
+  if (cel) {
+    void prepareRegisteredCel(id);
     activeClip = {
       id,
-      frameId: frameId || cel.frameId,
+      frameId: targetFrame,
       side,
       startedAt: performance.now(),
       durationMs: cel.durationMs,
@@ -320,7 +401,7 @@ function startClip(id, { frameId, side = 'left', onEnd } = {}) {
     };
     return;
   }
-  const sample0 = sampleScreenInteraction(id, 1, { frameId, side });
+  const sample0 = sampleScreenInteraction(id, 1, { frameId: targetFrame, side });
   if (!sample0) return;
   const durations = {
     'ledge-lean': 4800,
@@ -339,7 +420,7 @@ function startClip(id, { frameId, side = 'left', onEnd } = {}) {
   };
   activeClip = {
     id,
-    frameId: frameId || 'pose-sit-edge',
+    frameId: targetFrame,
     side,
     startedAt: performance.now(),
     durationMs: durations[id] || 4800,
@@ -353,6 +434,10 @@ async function init() {
   setCelAssetBase(base);
   setHeadpatAssetBase(base);
   setWaveAssetBase(base);
+
+  headpat = new AvatarHeadpat(elActor);
+  headpat.ensureFaceSrc();
+
   musicNoteImgs = getMusicNoteAssets(base).map(({ url }) => {
     const im = new Image();
     im.crossOrigin = 'anonymous';
@@ -360,7 +445,6 @@ async function init() {
     return im;
   });
 
-  // Register official v1 standing sprites
   const v1List = (config.manifest && config.manifest.sprites) || [];
   for (const item of v1List) {
     spriteUrls.set(item.id, `${base}/capri/sprites/v1/${item.file}`);
@@ -369,35 +453,23 @@ async function init() {
     spriteUrls.set('neutral', `${base}/capri/sprites/v1/capri-neutral.png`);
   }
 
-  // Register official poses-v2 sprites
   const poseList = (config.poses && config.poses.sprites) || [];
   for (const p of poseList) {
     spriteUrls.set(p.id, `${base}/capri/sprites/poses-v2/PNG/${p.file}`);
   }
 
-  // Register official music poses
   spriteUrls.set('music-floor', `${base}/default/capri-music-v1/capri-music-floor.png`);
   spriteUrls.set('music-window', `${base}/default/capri-music-v1/capri-music-window.png`);
 
-  // Preload core sprites + intro sequence + cels in parallel
+  // RAM Diet: Preload only 6 pinned core sprites + 7 intro frames + prime main keytar sheet
   const introMeta = (config.intro && config.intro.frames) || [];
   const introPromise = Promise.all(
     introMeta.map((f) => preloadImage(`${base}/capri/intro-v1/${f.file}`)),
   );
-  const spriteEntries = Array.from(spriteUrls.entries());
-  const spritePromise = Promise.all(
-    spriteEntries.map(async ([id, url]) => {
-      const im = await preloadImage(url);
-      if (im) spriteImgs.set(id, im);
-    }),
-  );
-  const celPromise = Promise.all(
-    ['hang-pullup', 'hang-catch', 'hang-wrist-scan', 'ledge-keytar'].map((c) =>
-      prepareRegisteredCel(c),
-    ),
-  );
+  const corePromise = Promise.all(Array.from(PINNED_SPRITES).map((id) => ensureSpriteLoaded(id)));
+  const celPromise = prepareRegisteredCel('ledge-keytar');
 
-  [introImages] = await Promise.all([introPromise, spritePromise, celPromise]);
+  [introImages] = await Promise.all([introPromise, corePromise, celPromise]);
 
   try {
     glRenderer = createRenderer(elGlCanvas, {}, { grid: 96 });
@@ -413,8 +485,8 @@ async function init() {
   }
 
   const br = await invoke('move_to_spot', { spot: 'bottom_right' }).catch(() => ({
-    x: (config.screenWidth || 1920) - ACTOR_SIZE - 24,
-    y: (config.screenHeight || 1080) - ACTOR_SIZE - 48,
+    x: (config.screenWidth || 1920) - actorSize - 24,
+    y: (config.screenHeight || 1080) - actorSize - 48,
   }));
   stage.x = br.x;
   stage.y = br.y;
@@ -425,13 +497,13 @@ async function init() {
   startHitRectSyncLoop();
   requestAnimationFrame(renderFrameLoop);
 
-  // Play official 24fps startup intro + TRIGGER red ribbons right on stage!
   introPlaying = true;
   elGlCanvas.style.opacity = '0';
   breachFx.playStartupIntroFx({
-    rect: { x: stage.x, y: stage.y, width: ACTOR_SIZE, height: ACTOR_SIZE },
+    rect: { x: stage.x, y: stage.y, width: actorSize, height: actorSize },
     introImages: introImages.filter(Boolean),
     onDone: () => {
+      introImages = [];
       introPlaying = false;
       elGlCanvas.style.opacity = '1';
       triggerSquish(1.06, 0.93);
@@ -452,7 +524,12 @@ async function setupTauriEvents() {
     const dt = Math.max(8, now - cursorPos.lastAt);
     const dx = p.x - cursorPos.lastX;
     const dy = p.y - cursorPos.lastY;
-    const speed = (Math.hypot(dx, dy) / dt) * 1000;
+    const distMoved = Math.hypot(dx, dy);
+    const speed = (distMoved / dt) * 1000;
+
+    if (distMoved > 4) {
+      cursorPos.stillSince = now;
+    }
 
     cursorPos.x = p.x;
     cursorPos.y = p.y;
@@ -462,20 +539,23 @@ async function setupTauriEvents() {
     if (p.screenW) config.screenWidth = p.screenW;
     if (p.screenH) config.screenHeight = p.screenH;
 
+    const cx = stage.x + actorSize * 0.5;
+    const cy = stage.y + actorSize * 0.44;
+    const curDist = Math.hypot(p.x - cx, p.y - cy);
+
     // Fast cursor whip near Capri -> 2-frame TRIGGER impact flinch!
-    const cx = stage.x + ACTOR_SIZE * 0.5;
-    const cy = stage.y + ACTOR_SIZE * 0.44;
     if (
       !hiddenStandby &&
       !dragActive &&
       !introPlaying &&
       speed > 2600 &&
-      Math.hypot(p.x - cx, p.y - cy) < 135 &&
+      curDist < 140 &&
       now - lastWhipAt > 3600
     ) {
       lastWhipAt = now;
-      triggerImpact(120, 260);
-      triggerSquish(0.92, 1.09);
+      triggerImpact(130, 260);
+      triggerSquish(0.91, 1.09);
+      breachFx.triggerImpactStar(cx, cy, actorSize * 0.44);
       breachFx.spawnMicroSlash(cx, cy - 18, Math.atan2(dy, dx), '#ff003d');
       flashOverrideMood('surprised', 950);
     }
@@ -497,6 +577,7 @@ async function setupTauriEvents() {
 }
 
 function flashOverrideMood(id, ms = 1100) {
+  void ensureSpriteLoaded(id);
   overrideMood = id;
   setTimeout(() => {
     if (overrideMood === id) overrideMood = null;
@@ -505,9 +586,34 @@ function flashOverrideMood(id, ms = 1100) {
 
 function renderFrameLoop(now) {
   requestAnimationFrame(renderFrameLoop);
-  if (hiddenStandby || introPlaying) return;
+  if (hiddenStandby || introPlaying || teleporting || breachInFlight) return;
 
   updateActorDomPosition();
+
+  // Curiosity cursor tease when pointer idles 60-220px away for >4.5s
+  const cxCur = stage.x + actorSize * 0.5;
+  const cyCur = stage.y + actorSize * 0.44;
+  const curDist = Math.hypot(cursorPos.x - cxCur, cursorPos.y - cyCur);
+  if (
+    !dragActive &&
+    !speaking &&
+    !thinking &&
+    !sleepingAfk &&
+    !muted &&
+    !activeClip &&
+    curDist >= 60 &&
+    curDist <= 220 &&
+    now - cursorPos.stillSince > 4500 &&
+    now - lastTeaseAt > 14000
+  ) {
+    lastTeaseAt = now;
+    cursorPos.stillSince = now;
+    const sideLean = cursorPos.x < cxCur ? -4.2 : 4.2;
+    stage.tiltDeg = sideLean;
+    flashOverrideMood('skeptical', 1100);
+    breachFx.spawnMicroSlash(cursorPos.x, cursorPos.y, Math.atan2(cursorPos.y - cyCur, cursorPos.x - cxCur), '#ff003d');
+    breachFx.spawnImpactBurst(cursorPos.x, cursorPos.y, { color: '#ff003d', count: 6, radius: 36 });
+  }
 
   // Ambient blinking when standing
   if (!speaking && !thinking && !activeClip && !musicActive && !muted && !sleepingAfk && !overrideMood) {
@@ -515,6 +621,8 @@ function renderFrameLoop(now) {
       lastBlinkAt = now;
       nextBlinkDelay = 2600 + Math.random() * 3400;
       blinkPhaseUntil = now + 150;
+      void ensureSpriteLoaded('idle-blink_half');
+      void ensureSpriteLoaded('idle-blink_closed');
     }
   }
   if (now < blinkPhaseUntil) {
@@ -524,18 +632,25 @@ function renderFrameLoop(now) {
     blinkFrame = null;
   }
 
-  // Live audio FFT amplitude while speaking
+  // Audio-reactive amplitude + syllable nod + plosive micro-glitch
   if (speaking && analyser && freqData) {
     analyser.getByteFrequencyData(freqData);
     let sum = 0;
     const bins = Math.min(28, freqData.length);
     for (let i = 1; i < bins; i++) sum += freqData[i];
+    prevAudioLevel = audioLevel;
     audioLevel = Math.min(1, sum / (bins - 1) / 135);
+    if (audioLevel - prevAudioLevel > 0.12) {
+      speechNod += (Math.random() < 0.5 ? 1 : -1) * 3.8;
+    }
+    if (audioLevel > 0.58 && now >= glitchUntil) {
+      glitchUntil = now + 38;
+    }
   } else if (!speaking) {
     audioLevel *= 0.8;
   }
+  speechNod *= 0.78;
 
-  // Wave WebP override
   if (wave.image) {
     elGlCanvas.style.opacity = '0';
     elOverlayCanvas.style.opacity = '0';
@@ -546,7 +661,6 @@ function renderFrameLoop(now) {
   const baseImg = syncSourceImg(targetId);
   if (!baseImg || !baseImg.complete) return;
 
-  // Build deformation channels
   const poseKey = resolvePose(targetId);
   const tSec = now / 1000;
   let channels = {
@@ -555,18 +669,16 @@ function renderFrameLoop(now) {
     breath: 0.5 + 0.5 * Math.sin(tSec * (sleepingAfk || muted ? 1.5 : 2.3)),
     lean: Math.sin(tSec * 1.15) * 1.1 + stage.tiltDeg * 0.25,
     lift: Math.sin(tSec * 2.3) * 3.2,
-    head: Math.sin(tSec * 0.9) * 1.4 + (speaking ? Math.sin(tSec * 8.5) * audioLevel * 3.2 : 0),
+    head: Math.sin(tSec * 0.9) * 1.4 + speechNod + (speaking ? Math.sin(tSec * 8.5) * audioLevel * 3.2 : 0),
     headY: Math.sin(tSec * 2.3 + 0.5) * 2.2,
   };
 
-  // Compute cursor gaze normalized [-1, 1] relative to Capri eyes
-  const cx = stage.x + ACTOR_SIZE * 0.5;
-  const cy = stage.y + ACTOR_SIZE * 0.36;
+  const cx = stage.x + actorSize * 0.5;
+  const cy = stage.y + actorSize * 0.36;
   const gx = Math.max(-1, Math.min(1, (cursorPos.x - cx) / 380));
   const gy = Math.max(-1, Math.min(1, (cursorPos.y - cy) / 280));
-  let activeGaze = { x: gx, y: gy };
+  const activeGaze = { x: gx, y: gy };
 
-  // Check active Screen Interaction clip or 12-frame Registered Cel
   if (activeClip) {
     const elapsed = now - activeClip.startedAt;
     if (elapsed >= activeClip.durationMs) {
@@ -603,17 +715,15 @@ function renderFrameLoop(now) {
     }
   }
 
-  // Standard & Posed WebGL Rendering + LipSync + Headpat + Optical Gaze + Music Notes
   elGlCanvas.style.opacity = '1';
   elOverlayCanvas.style.opacity = '1';
 
-  // Cap ambient WebGL mesh updates at Studio TRIGGER 24fps unless speaking/glitching
+  // Cap ambient WebGL mesh deformation at Studio TRIGGER 24fps unless speaking/glitching/dragging
   if (!speaking && now >= glitchUntil && now >= impactUntil && !dragActive && now - lastGlTickAt < 40) {
     return;
   }
   lastGlTickAt = now;
 
-  // Subtle standing gaze sprite when idle & neutral
   let renderBaseId = targetId;
   let renderImg = baseImg;
   if (
@@ -636,17 +746,19 @@ function renderFrameLoop(now) {
       renderBaseId = gazeSprite;
       renderImg = spriteImgs.get(gazeSprite);
       syncSourceImg(gazeSprite);
+    } else {
+      void ensureSpriteLoaded(gazeSprite);
     }
   }
 
-  // Official cross-pose mouth shape
   const shape = visemes.sample(now, speaking, audioLevel);
-  let composited = headpat.image(elSourceImg);
-  if (composited === elSourceImg) composited = renderImg;
-  mouthLayer.update(composited, shape, renderBaseId);
-  composited = mouthLayer.image(composited);
+  const headpatActive = Boolean(headpat && headpat.image(elSourceImg) !== elSourceImg);
+  let composited = headpatActive ? headpat.image(elSourceImg) : renderImg;
+  if (elSourceImg.complete && elSourceImg.naturalWidth === 1254 && !headpatActive) {
+    mouthLayer.update(composited, shape, renderBaseId);
+    composited = mouthLayer.image(composited);
+  }
 
-  // Official Music BPM choreography
   let musicState = null;
   if (musicActive) {
     musicState = musicAnim.sample(now, {
@@ -680,12 +792,11 @@ function renderFrameLoop(now) {
     });
   }
 
-  // Paint optical gaze + floating music notes on 1254px overlay canvas
   elOverlayCtx.clearRect(0, 0, CANVAS_EXTENT, CANVAS_EXTENT);
   if (!glRenderer && renderImg) {
     elOverlayCtx.drawImage(renderImg, 0, 0, CANVAS_EXTENT, CANVAS_EXTENT);
   }
-  if (!muted && !sleepingAfk && !blinkFrame) {
+  if (!muted && !sleepingAfk && !blinkFrame && !headpatActive && !overrideMood) {
     drawSurfaceGaze(elOverlayCtx, renderImg, renderBaseId, activeGaze, glRenderer?.channels || channels);
   }
   if (musicState?.notes?.length) {
@@ -701,9 +812,11 @@ function renderFrameLoop(now) {
 async function teleportTo(targetBox, { pose = 'neutral', style = 'lightning', clip = null, onArrive } = {}) {
   if (teleporting) return;
   teleporting = true;
+  wave.stop();
+  await ensureSpriteLoaded(pose);
   const clamped = clampActorPos(targetBox.x, targetBox.y);
-  const fromBox = { x: stage.x, y: stage.y, size: ACTOR_SIZE };
-  const toBox = { x: clamped.x, y: clamped.y, size: ACTOR_SIZE };
+  const fromBox = { x: stage.x, y: stage.y, size: actorSize };
+  const toBox = { x: clamped.x, y: clamped.y, size: actorSize };
 
   const fromImg = getSpriteImg(activeSpriteId());
   const toImg = getSpriteImg(pose);
@@ -743,6 +856,8 @@ function triggerRedBreachSummon(source = 'hotkey', curX, curY) {
   sleepingAfk = false;
   musicActive = false;
   activeClip = null;
+  breachInFlight = true;
+  wave.stop();
   screenRig?.clear();
   elActor.classList.remove('hidden-standby');
   playBreachSummonSound(audioCtx);
@@ -754,19 +869,19 @@ function triggerRedBreachSummon(source = 'hotkey', curX, curY) {
   let ty;
   if (Number.isFinite(curX) && Number.isFinite(curY)) {
     const onLeft = curX > w * 0.5;
-    tx = onLeft ? curX - ACTOR_SIZE - 44 : curX + 44;
-    ty = curY - ACTOR_SIZE * 0.55;
+    tx = onLeft ? curX - actorSize - 44 : curX + 44;
+    ty = curY - actorSize * 0.55;
   } else {
-    tx = w - ACTOR_SIZE - 28;
-    ty = h - ACTOR_SIZE - 52;
+    tx = w - actorSize - 28;
+    ty = h - actorSize - 52;
   }
   const dest = clampActorPos(tx, ty);
   const fromBox = {
     x: dest.x + (dest.x > w * 0.5 ? 240 : -240),
     y: Math.max(0, dest.y - 260),
-    size: ACTOR_SIZE,
+    size: actorSize,
   };
-  const toBox = { x: dest.x, y: dest.y, size: ACTOR_SIZE };
+  const toBox = { x: dest.x, y: dest.y, size: actorSize };
 
   elGlCanvas.style.opacity = '0';
   elOverlayCanvas.style.opacity = '0';
@@ -776,8 +891,9 @@ function triggerRedBreachSummon(source = 'hotkey', curX, curY) {
     to: toBox,
     spriteImg: getSpriteImg('smirk'),
     arrivalImg: getSpriteImg('smirk'),
-    style: Math.random() < 0.35 ? 'sandevistan' : 'lightning',
+    style: source === 'debug' ? 'lightning' : Math.random() < 0.35 ? 'sandevistan' : 'lightning',
     onArrive: () => {
+      breachInFlight = false;
       stage.x = toBox.x;
       stage.y = toBox.y;
       setMood('smirk');
@@ -785,7 +901,7 @@ function triggerRedBreachSummon(source = 'hotkey', curX, curY) {
       triggerSquish(1.1, 0.89);
       elGlCanvas.style.opacity = '1';
       elOverlayCanvas.style.opacity = '1';
-      void wave.play();
+      if (source !== 'debug') void wave.play();
       if (source === 'hotkey') {
         const lines = [
           'Yo Bos! Ada apaan manggil mendadak?',
@@ -793,7 +909,7 @@ function triggerRedBreachSummon(source = 'hotkey', curX, curY) {
           'Dipanggil langsung nongol nih, mau ngapain kita?',
         ];
         speakText(lines[Math.floor(Math.random() * lines.length)]);
-      } else {
+      } else if (source === 'voice') {
         speakText('Gue di sini Bos, ngomong aja.');
       }
     },
@@ -803,26 +919,30 @@ function triggerRedBreachSummon(source = 'hotkey', curX, curY) {
 function handleLaptopActivityUpdate(wasIdle) {
   const now = performance.now();
 
-  // Battery low warning (< 20% unplugged, once per discharge cycle)
   if (laptopState.batteryPct > 0 && laptopState.batteryPct < 20 && !laptopState.onAc) {
     if (!batteryWarnedInCycle && !muted && !hiddenStandby && !speaking && !inFlightRequest) {
       batteryWarnedInCycle = true;
-      breachFx.spawnImpactBurst(stage.x + 160, stage.y + 120, { color: '#ff003d', count: 16, radius: 130 });
+      breachFx.spawnImpactBurst(stage.x + actorSize * 0.5, stage.y + actorSize * 0.4, {
+        color: '#ff003d',
+        count: 16,
+        radius: 130,
+      });
       triggerImpact(150, 420);
       flashOverrideMood('concerned', 3200);
-      speakText(`Eh Bos, baterai laptop tinggal ${laptopState.batteryPct} persen tuh! Colok charger dulu gih sebelum jeglek.`);
+      speakText(
+        `Eh Bos, baterai laptop tinggal ${laptopState.batteryPct} persen tuh! Colok charger dulu gih sebelum jeglek.`,
+      );
     }
   } else if (laptopState.onAc || laptopState.batteryPct >= 30) {
     batteryWarnedInCycle = false;
   }
 
-  // AFK Sleep & Wake-Up
   if (laptopState.idleMs > 300_000 && !sleepingAfk && !muted && !hiddenStandby && !speaking && !dragActive) {
     sleepingAfk = true;
     musicActive = false;
     activeClip = null;
-    const brX = Math.max(20, (config.screenWidth || 1920) - ACTOR_SIZE - 26);
-    const brY = Math.max(0, (config.screenHeight || 1080) - ACTOR_SIZE - 48);
+    const brX = Math.max(20, (config.screenWidth || 1920) - actorSize - 26);
+    const brY = Math.max(0, (config.screenHeight || 1080) - actorSize - 48);
     teleportTo({ x: brX, y: brY }, { pose: 'pose-sleep', style: 'lightning' });
     return;
   }
@@ -836,13 +956,11 @@ function handleLaptopActivityUpdate(wasIdle) {
     return;
   }
 
-  // Stop background music choreography cleanly when leaving music mode
   if (musicActive && laptopState.activityMode !== 'music' && now - lastActivityReactAt > 12000) {
     musicActive = false;
     setMood('neutral');
   }
 
-  // Adaptive per-activity reaction (minimum 38s cooldown between autonomous moves)
   if (
     !autoRoam ||
     muted ||
@@ -864,15 +982,16 @@ function handleLaptopActivityUpdate(wasIdle) {
     musicActive = true;
     musicStartedAt = now;
     musicFrameId = laptopState.fgRect?.w > 300 && !laptopState.fgFullscreen ? 'music-window' : 'music-floor';
+    void ensureSpriteLoaded(musicFrameId);
     return;
   }
 
   if (laptopState.fgFullscreen || laptopState.activityMode === 'video_game') {
-    const cornerX = (config.screenWidth || 1920) - ACTOR_SIZE + 44;
+    const cornerX = (config.screenWidth || 1920) - actorSize + 44;
     if (Math.abs(stage.x - cornerX) > 90) {
       lastActivityReactAt = now;
       teleportTo(
-        { x: cornerX, y: (config.screenHeight || 1080) - ACTOR_SIZE - 48 },
+        { x: cornerX, y: (config.screenHeight || 1080) - actorSize - 48 },
         { pose: 'pose-dock-right', style: 'sandevistan' },
       );
     }
@@ -881,8 +1000,8 @@ function handleLaptopActivityUpdate(wasIdle) {
 
   if (laptopState.activityMode === 'coding' && laptopState.fgRect?.w > 360) {
     const r = laptopState.fgRect;
-    const tx = Math.max(0, Math.min((config.screenWidth || 1920) - ACTOR_SIZE, r.x + r.w - ACTOR_SIZE - 14));
-    const ty = Math.max(-18, Math.min((config.screenHeight || 1080) - ACTOR_SIZE, r.y - ACTOR_SIZE * 0.56));
+    const tx = Math.max(0, Math.min((config.screenWidth || 1920) - actorSize, r.x + r.w - actorSize - 14));
+    const ty = Math.max(-18, Math.min((config.screenHeight || 1080) - actorSize, r.y - actorSize * 0.56));
     if (Math.hypot(stage.x - tx, stage.y - ty) > 75 || currentBaseMood !== 'pose-sit-edge') {
       lastActivityReactAt = now;
       const clips = ['bar-read', 'bar-perch', 'ledge-peek'];
@@ -918,7 +1037,6 @@ function startAutonomousLoop() {
     if (now - lastAutoRoamAt < 34_000) return;
     lastAutoRoamAt = now;
 
-    // Restless cels after 90s AFK
     if (laptopState.idleMs > 90_000) {
       const res = await invoke('move_to_spot', { spot: 'ceiling' }).catch(() => null);
       if (res?.ok) {
@@ -979,31 +1097,35 @@ function startAutonomousLoop() {
   }, 6000);
 }
 
-// Dragging with official SVG AvatarDragTether + spring velocity tilt + smart edge landing!
+// Dragging with official SVG AvatarDragTether + velocity fling wall-slam + smart snap
 let dragStartMouse = null;
 let dragStartStage = null;
 let dragAnchorCenter = null;
 let dragLastMouse = null;
 let dragLastAt = 0;
+let dragVx = 0;
+let dragVy = 0;
 let dragSeed = 1337;
 let pokeTimestamps = [];
 
 elActor.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return;
   ensureAudioCtx();
-  dragStartMouse = { x: e.screenX, y: e.screenY };
-  dragLastMouse = { x: e.screenX, y: e.screenY };
+  dragStartMouse = { x: e.clientX, y: e.clientY };
+  dragLastMouse = { x: e.clientX, y: e.clientY };
   dragLastAt = performance.now();
   dragStartStage = { x: stage.x, y: stage.y };
-  dragAnchorCenter = { x: stage.x + ACTOR_SIZE * 0.5, y: stage.y + ACTOR_SIZE * 0.55 };
+  dragAnchorCenter = { x: stage.x + actorSize * 0.5, y: stage.y + actorSize * 0.55 };
+  dragVx = 0;
+  dragVy = 0;
   dragSeed = (Date.now() & 0xffffff) >>> 0;
   dragActive = false;
 });
 
 window.addEventListener('mousemove', (e) => {
   if (!dragStartMouse) return;
-  const dx = e.screenX - dragStartMouse.x;
-  const dy = e.screenY - dragStartMouse.y;
+  const dx = e.clientX - dragStartMouse.x;
+  const dy = e.clientY - dragStartMouse.y;
   if (!dragActive && Math.hypot(dx, dy) > 5) {
     dragActive = true;
     activeClip = null;
@@ -1020,14 +1142,17 @@ window.addEventListener('mousemove', (e) => {
 
   const now = performance.now();
   const dt = Math.max(8, now - dragLastAt);
-  const vx = ((e.screenX - dragLastMouse.x) / dt) * 16;
-  dragLastMouse = { x: e.screenX, y: e.screenY };
+  const instVx = ((e.clientX - dragLastMouse.x) / dt) * 16;
+  const instVy = ((e.clientY - dragLastMouse.y) / dt) * 16;
+  dragVx = dragVx * 0.45 + instVx * 0.55;
+  dragVy = dragVy * 0.45 + instVy * 0.55;
+  dragLastMouse = { x: e.clientX, y: e.clientY };
   dragLastAt = now;
-  stage.tiltDeg = Math.max(-16, Math.min(16, vx * 1.1));
+  stage.tiltDeg = Math.max(-16, Math.min(16, dragVx * 1.1));
 
   dragTether.draw({
     from: dragAnchorCenter,
-    to: { x: stage.x + ACTOR_SIZE * 0.5, y: stage.y + ACTOR_SIZE * 0.55 },
+    to: { x: stage.x + actorSize * 0.5, y: stage.y + actorSize * 0.55 },
     intensity: 88,
     chaos: 64,
     seed: dragSeed,
@@ -1037,6 +1162,8 @@ window.addEventListener('mousemove', (e) => {
 window.addEventListener('mouseup', () => {
   if (!dragStartMouse) return;
   const wasDragging = dragActive;
+  const flingVx = dragVx;
+  const flingVy = dragVy;
   dragStartMouse = null;
   dragActive = false;
   if (!wasDragging) return;
@@ -1048,6 +1175,53 @@ window.addEventListener('mouseup', () => {
   const w = config.screenWidth || window.innerWidth || 1920;
   const h = config.screenHeight || window.innerHeight || 1080;
 
+  // High-velocity Drag Fling -> Sandevistan Wall-Slam!
+  if (Math.hypot(flingVx, flingVy) > 20) {
+    const projX = Math.max(-46, Math.min(w - actorSize + 46, stage.x + flingVx * 18));
+    const projY = Math.max(-18, Math.min(h - actorSize - 42, stage.y + flingVy * 18));
+    if (projY < 90) {
+      teleportTo(
+        { x: projX, y: -18 },
+        {
+          pose: 'pose-ceiling',
+          style: 'sandevistan',
+          clip: { id: 'hang-catch', frameId: 'pose-ceiling' },
+          onArrive: () => breachFx.triggerImpactStar(projX + actorSize * 0.5, 48, 170),
+        },
+      );
+    } else if (projX < 70) {
+      teleportTo(
+        { x: -46, y: projY },
+        {
+          pose: 'pose-dock-left',
+          style: 'sandevistan',
+          clip: { id: 'edge-lean', frameId: 'pose-dock-left', side: 'left' },
+          onArrive: () => breachFx.triggerImpactStar(36, projY + actorSize * 0.5, 165),
+        },
+      );
+    } else if (projX > w - actorSize - 70) {
+      teleportTo(
+        { x: w - actorSize + 46, y: projY },
+        {
+          pose: 'pose-dock-right',
+          style: 'sandevistan',
+          clip: { id: 'edge-lean', frameId: 'pose-dock-right', side: 'right' },
+          onArrive: () => breachFx.triggerImpactStar(w - 36, projY + actorSize * 0.5, 165),
+        },
+      );
+    } else {
+      teleportTo(
+        { x: projX, y: h - actorSize - 48 },
+        {
+          pose: 'pose-sit-floor',
+          style: 'sandevistan',
+          onArrive: () => breachFx.triggerImpactStar(projX + actorSize * 0.5, h - 64, 175),
+        },
+      );
+    }
+    return;
+  }
+
   if (stage.y < 85) {
     stage.y = -18;
     setMood('pose-ceiling');
@@ -1057,20 +1231,25 @@ window.addEventListener('mouseup', () => {
     stage.x = -46;
     setMood('pose-dock-left');
     startClip('edge-lean', { frameId: 'pose-dock-left', side: 'left' });
-  } else if (stage.x > w - ACTOR_SIZE - 75) {
-    stage.x = w - ACTOR_SIZE + 46;
+  } else if (stage.x > w - actorSize - 75) {
+    stage.x = w - actorSize + 46;
     setMood('pose-dock-right');
     startClip('edge-lean', { frameId: 'pose-dock-right', side: 'right' });
   } else if (
     laptopState.fgRect?.w > 300 &&
-    Math.abs(stage.y + ACTOR_SIZE * 0.58 - laptopState.fgRect.y) < 75
+    Math.abs(stage.y + actorSize * 0.58 - laptopState.fgRect.y) < 75
   ) {
-    stage.y = laptopState.fgRect.y - ACTOR_SIZE * 0.56;
+    stage.y = laptopState.fgRect.y - actorSize * 0.56;
     setMood('pose-sit-edge');
     startClip('bar-perch', { frameId: 'pose-sit-edge', side: 'left' });
     triggerSquish(1.09, 0.9);
   } else {
-    breachFx.spawnImpactBurst(stage.x + 160, stage.y + 280, { color: '#ff003d', count: 12, radius: 92 });
+    breachFx.triggerImpactStar(stage.x + actorSize * 0.5, stage.y + actorSize * 0.85, 130);
+    breachFx.spawnImpactBurst(stage.x + actorSize * 0.5, stage.y + actorSize * 0.85, {
+      color: '#ff003d',
+      count: 12,
+      radius: 92,
+    });
     triggerImpact(80, 180);
     triggerSquish(1.11, 0.88);
     setMood(stage.y > h - 420 ? 'pose-sit-floor' : 'neutral');
@@ -1081,6 +1260,32 @@ window.addEventListener('mouseup', () => {
     }
   }
 });
+
+// Double-click -> instant flashy stunt cycle
+elActor.addEventListener('dblclick', (e) => {
+  if (dragActive) return;
+  e.preventDefault();
+  ensureAudioCtx();
+  const mode = stuntCycleIndex++ % 4;
+  if (mode === 0) {
+    executeSelfControl({ action: 'sandevistan' });
+  } else if (mode === 1) {
+    startClip('ledge-keytar', { frameId: 'pose-sit-edge' });
+  } else if (mode === 2) {
+    void wave.play();
+  } else {
+    executeSelfControl({ action: 'ceiling' });
+  }
+});
+
+// Wheel zoom -> spring resize 220..420 px
+elActor.addEventListener(
+  'wheel',
+  (e) => {
+    setActorScaleSize(actorSize + (e.deltaY < 0 ? 22 : -22));
+  },
+  { passive: true },
+);
 
 // Rapid-poke reaction
 elActor.addEventListener('click', () => {
@@ -1093,7 +1298,8 @@ elActor.addEventListener('click', () => {
     pokeTimestamps = [];
     triggerImpact(130, 320);
     triggerSquish(1.08, 0.91);
-    breachFx.spawnMicroSlash(stage.x + 160, stage.y + 130, -0.5, '#ff003d');
+    breachFx.triggerImpactStar(stage.x + actorSize * 0.5, stage.y + actorSize * 0.42, 130);
+    breachFx.spawnMicroSlash(stage.x + actorSize * 0.5, stage.y + actorSize * 0.4, -0.5, '#ff003d');
     flashOverrideMood('annoyed', 2600);
     if (!muted) {
       speakText('Heh, jangan colek-colek mulu napa Bos! Emang gue tombol lift?');
@@ -1106,18 +1312,27 @@ let lastPatPoint = null;
 let patAccum = 0;
 let lastPatFireAt = 0;
 
-function fireHeadpat(clientX, clientY) {
+function fireHeadpat(clientX, clientY, quiet = false) {
   const now = performance.now();
-  if (now - lastPatFireAt < 750) return;
+  if (!quiet && now - lastPatFireAt < 750) return;
   lastPatFireAt = now;
   ensureAudioCtx();
   playHeadpatChime(audioCtx);
   triggerSquish(1.06, 0.93);
+  wave.stop();
   activeClip = null;
   screenRig?.clear();
-  const fid = syncSourceImg(activeSpriteId()) ? activeSpriteId() : 'neutral';
-  headpat.play(elSourceImg, { x: clientX, y: clientY }, { x: 0, y: 0, width: ACTOR_SIZE, height: ACTOR_SIZE }, true, fid);
-  if (!muted && !speaking && !inFlightRequest && Math.random() < 0.7) {
+  const fid = activeSpriteId();
+  syncSourceImg(fid);
+  headpat?.ensureFaceSrc();
+  headpat?.play(
+    elSourceImg,
+    { x: clientX, y: clientY },
+    { x: 0, y: 0, width: actorSize, height: actorSize },
+    true,
+    fid,
+  );
+  if (!quiet && !muted && !speaking && !inFlightRequest && Math.random() < 0.7) {
     const lines = [
       'Hmm, lumayan lah elusannya Bos.',
       'Jangan kebiasaan manjain gitu dong, gue bukan kucing.',
@@ -1248,6 +1463,9 @@ async function speakText(text, forceUnmute = false) {
     tailNode.connect(analyser);
     analyser.connect(audioCtx.destination);
 
+    wave.stop();
+    activeClip = null;
+    screenRig?.clear();
     speaking = true;
     await new Promise((resolve) => {
       src.onended = () => {
@@ -1274,7 +1492,11 @@ async function executeSelfControl(args) {
     musicActive = false;
     activeClip = null;
     screenRig?.clear();
-    breachFx.spawnImpactBurst(stage.x + 160, stage.y + 160, { color: '#ff003d', count: 14, radius: 110 });
+    breachFx.spawnImpactBurst(stage.x + actorSize * 0.5, stage.y + actorSize * 0.5, {
+      color: '#ff003d',
+      count: 14,
+      radius: 110,
+    });
     elActor.classList.add('hidden-standby');
     invoke('update_hit_rects', { rects: [] }).catch(() => {});
     return { ok: true, action: 'mute' };
@@ -1288,7 +1510,11 @@ async function executeSelfControl(args) {
 
   if (action === 'quit') {
     if (reply && !muted) await speakText(reply);
-    breachFx.spawnImpactBurst(stage.x + 160, stage.y + 160, { color: '#ff003d', count: 22, radius: 170 });
+    breachFx.spawnImpactBurst(stage.x + actorSize * 0.5, stage.y + actorSize * 0.5, {
+      color: '#ff003d',
+      count: 22,
+      radius: 170,
+    });
     elActor.classList.add('hidden-standby');
     await new Promise((r) => setTimeout(r, 420));
     await invoke('quit_app').catch(() => {});
@@ -1350,6 +1576,7 @@ async function executeSelfControl(args) {
   }
 
   if (action === 'dance') {
+    void ensureSpriteLoaded('music-floor');
     musicActive = true;
     musicStartedAt = performance.now();
     musicFrameId = 'music-floor';
@@ -1475,7 +1702,13 @@ async function sendVoiceTurn(userText) {
   while (history.length > 10) history.shift();
 
   const wantsDesktopTool = DESKTOP_INTENT_RE.test(userText);
-  const toolsForTurn = wantsDesktopTool ? [SELF_CONTROL_TOOL, DESKTOP_CONTROL_TOOL] : [SELF_CONTROL_TOOL];
+  const wantsSelfTool = SELF_ACTION_INTENT_RE.test(userText);
+  const toolsForTurn = wantsDesktopTool
+    ? [SELF_CONTROL_TOOL, DESKTOP_CONTROL_TOOL]
+    : wantsSelfTool
+      ? [SELF_CONTROL_TOOL]
+      : [];
+
   const timeStr = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
   const ctxMsg = {
     role: 'system',
@@ -1487,15 +1720,19 @@ async function sendVoiceTurn(userText) {
     let handledTerminalSelf = false;
 
     for (let step = 0; step < 5; step++) {
+      const reqBody = {
+        model: 'capri-gemini-flash',
+        stream: false,
+        messages: [ctxMsg, ...history],
+      };
+      if (toolsForTurn.length > 0) {
+        reqBody.tools = toolsForTurn;
+      }
+
       const resp = await fetch(`${config.brainUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'capri-gemini-flash',
-          stream: false,
-          messages: [ctxMsg, ...history],
-          tools: toolsForTurn,
-        }),
+        body: JSON.stringify(reqBody),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
@@ -1601,7 +1838,6 @@ async function startMicVad() {
 
     micSource = audioCtx.createMediaStreamSource(micStream);
 
-    // Bandpass branch (300-3200Hz) purely for fan/keyboard noise rejection in VAD
     const hp = audioCtx.createBiquadFilter();
     hp.type = 'highpass';
     hp.frequency.value = 300;
@@ -1615,7 +1851,6 @@ async function startMicVad() {
     hp.connect(lp);
     lp.connect(vadAnalyser);
 
-    // Raw PCM capture branch -> zeroGain
     micProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
     const zeroGain = audioCtx.createGain();
     zeroGain.gain.value = 0;
@@ -1788,5 +2023,58 @@ function encodeMonoWav16k(chunks, srcRate) {
   }
   return new Blob([buffer], { type: 'audio/wav' });
 }
+
+// Deterministic debug & verification hooks
+window.__CAPRI_DEBUG__ = {
+  triggerSummon: (cx, cy) => triggerRedBreachSummon('debug', cx, cy),
+  triggerHeadpat: () => {
+    const r = elActor.getBoundingClientRect();
+    fireHeadpat(r.left + r.width * 0.5, r.top + r.height * 0.18, true);
+  },
+  triggerCel: async (id = 'ledge-keytar') => {
+    wave.stop();
+    activeClip = null;
+    const fid = id === 'ledge-keytar' ? 'pose-sit-edge' : 'pose-ceiling';
+    await ensureSpriteLoaded(fid);
+    await prepareRegisteredCel(id);
+    setMood(fid);
+    syncSourceImg(fid);
+    startClip(id, { frameId: fid });
+  },
+  triggerDragTether: () => {
+    dragActive = true;
+    const fx = stage.x - 220;
+    const fy = stage.y - 140;
+    dragTether.draw({
+      from: { x: fx, y: fy },
+      to: { x: stage.x + actorSize * 0.5, y: stage.y + actorSize * 0.55 },
+      intensity: 95,
+      chaos: 70,
+      seed: 90210,
+    });
+  },
+  clearDragTether: () => {
+    dragActive = false;
+    dragTether.clear();
+  },
+  triggerImpact: () => {
+    triggerImpact(450, 450);
+    breachFx.triggerImpactStar(stage.x + actorSize * 0.5, stage.y + actorSize * 0.45, 185);
+    breachFx.spawnImpactBurst(stage.x + actorSize * 0.5, stage.y + actorSize * 0.45, {
+      color: '#ff003d',
+      count: 16,
+      radius: 140,
+    });
+  },
+  getState: () => ({
+    x: stage.x,
+    y: stage.y,
+    actorSize,
+    mood: currentBaseMood,
+    cachedSprites: spriteImgs.size,
+    introPlaying,
+    activeClip: activeClip?.id || null,
+  }),
+};
 
 init().catch((e) => console.error('Capri init error:', e));
